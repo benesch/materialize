@@ -43,6 +43,7 @@ use expr::{
     GlobalId, Id, IdHumanizer, NullaryFunc, RelationExpr, RowSetFinishing, ScalarExpr,
     SourceInstanceId,
 };
+use metrics::MetricRegistry;
 use ore::collections::CollectionExt;
 use ore::thread::JoinHandleExt;
 use repr::{ColumnName, Datum, RelationDesc, RelationType, Row, RowPacker};
@@ -92,6 +93,7 @@ where
 {
     pub switchboard: comm::Switchboard<C>,
     pub num_timely_workers: usize,
+    pub metric_registry: MetricRegistry,
     pub symbiosis_url: Option<&'a str>,
     pub logging: Option<&'a LoggingConfig>,
     pub logging_granularity: Option<Duration>,
@@ -123,7 +125,7 @@ where
     /// that is servicing the TAIL. A connection can only run one TAIL at a
     /// time.
     active_tails: HashMap<u32, GlobalId>,
-    timestamp_config: TimestampConfig,
+    timestamper: Timestamper,
     /// Delta from leading edge of an arrangement from which we allow compaction.
     logical_compaction_window_ms: Option<Timestamp>,
     /// Instance count: number of times sources have been instantiated in views. This is used
@@ -190,6 +192,7 @@ where
         });
         let logging = config.logging;
         let (tx, rx) = config.switchboard.mpsc_limited(config.num_timely_workers);
+        let (ts_tx, ts_rx) = std::sync::mpsc::channel();
         broadcast(&mut broadcast_tx, SequencedCommand::EnableFeedback(tx));
         let mut coord = Self {
             switchboard: config.switchboard,
@@ -210,7 +213,7 @@ where
                 .logging_granularity
                 .and_then(|c| c.as_millis().try_into().ok()),
             executor: config.executor.clone(),
-            timestamp_config: config.timestamp,
+            timestamper: Timestamper::new(&config.timestamp, metric_registry),
             logical_compaction_window_ms,
             feedback_rx: Some(rx),
             start_time: Instant::now(),
@@ -415,7 +418,7 @@ where
 
         let (ts_tx, ts_rx) = std::sync::mpsc::channel();
         let mut timestamper =
-            Timestamper::new(&self.timestamp_config, internal_cmd_tx.clone(), ts_rx);
+            Timestamper::new(&self.timestamp_config, self.metric_registry, internal_cmd_tx.clone(), ts_rx);
         let executor = self.executor.clone();
         let _timestamper_thread =
             thread::spawn(move || executor.enter(|| timestamper.update())).join_on_drop();

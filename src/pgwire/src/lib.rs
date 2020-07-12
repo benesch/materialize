@@ -25,6 +25,7 @@
 mod codec;
 mod id_alloc;
 mod message;
+mod metrics;
 mod protocol;
 mod secrets;
 mod server;

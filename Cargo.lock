@@ -484,6 +484,7 @@ dependencies = [
  "itertools",
  "lazy_static",
  "log",
+ "metrics",
  "mz-avro",
  "ore",
  "pgrepr",
@@ -1765,6 +1766,7 @@ dependencies = [
  "krb5-src",
  "lazy_static",
  "log",
+ "metrics",
  "once_cell",
  "openssl",
  "openssl-sys",
@@ -1849,6 +1851,13 @@ dependencies = [
  "ore",
  "tokio",
  "tokio-postgres",
+]
+
+[[package]]
+name = "metrics"
+version = "0.1.0"
+dependencies = [
+ "prometheus",
 ]
 
 [[package]]
@@ -2411,6 +2420,7 @@ dependencies = [
  "itertools",
  "lazy_static",
  "log",
+ "metrics",
  "openssl",
  "ordered-float",
  "ore",

@@ -23,6 +23,7 @@ use anyhow::anyhow;
 use compile_time_run::run_command_str;
 use futures::channel::mpsc;
 use openssl::ssl::{SslAcceptor, SslFiletype, SslMethod};
+use prometheus::UIntGauge;
 use stream_cancel::{StreamExt as _, Trigger, Tripwire};
 use tokio::io;
 use tokio::net::TcpListener;
@@ -30,6 +31,8 @@ use tokio::runtime::Runtime;
 
 use comm::Switchboard;
 use dataflow_types::logging::LoggingConfig;
+use metrics::{metric, MetricRegistry};
+use ore::cast::CastFrom;
 use ore::thread::{JoinHandleExt, JoinOnDropHandle};
 use ore::tokio::net::TcpStreamExt;
 
@@ -208,6 +211,21 @@ pub fn serve(mut config: Config) -> Result<Server, anyhow::Error> {
         SocketAddr::new(listen_addr.ip(), local_addr.port()),
     );
 
+    let metrics_registry = MetricRegistry::new();
+
+    metrics_registry
+        .register::<UIntGauge>(metric!(
+            name: "mz_server_metadata_timely_worker_threads",
+            help: "number of timely workers materialized is running with",
+        ))
+        .set(u64::cast_from(num_timely_workers));
+
+    metrics_registry.register::<UIntGauge>(metric!(
+        name: "mz_server_metadata_seconds",
+        help: "server metadata, value is uptime",
+        const_labels: { "build_time" => BUILD_TIME, "version" => VERSION, "build_sha" => BUILD_SHA },
+    ));
+
     let switchboard = Switchboard::new(config.addresses, config.process, executor.clone());
 
     // Launch task to serve connections.
@@ -231,12 +249,16 @@ pub fn serve(mut config: Config) -> Result<Server, anyhow::Error> {
             if is_primary {
                 let mut mux = Mux::new();
                 mux.add_handler(switchboard.clone());
-                mux.add_handler(pgwire::Server::new(tls.clone(), cmdq_tx.clone()));
+                mux.add_handler(pgwire::Server::new(
+                    &metrics_registry,
+                    tls.clone(),
+                    cmdq_tx.clone(),
+                ));
                 mux.add_handler(http::Server::new(
+                    metrics_registry.clone(),
                     tls,
                     cmdq_tx,
                     start_time,
-                    &num_timely_workers.to_string(),
                 ));
                 mux.serve(incoming.take_until_if(drain_tripwire)).await;
             }

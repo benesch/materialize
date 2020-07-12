@@ -21,7 +21,10 @@ use hyper::{service, Method};
 use openssl::ssl::SslAcceptor;
 use tokio::io::{AsyncRead, AsyncWrite};
 
+use ::metrics::MetricRegistry;
 use ore::netio::SniffedStream;
+
+use crate::http::metrics::Metrics;
 
 mod catalog;
 mod metrics;
@@ -40,6 +43,7 @@ fn sniff_tls(buf: &[u8]) -> bool {
 }
 
 pub struct Server {
+    metrics: Metrics,
     tls: Option<SslAcceptor>,
     cmdq_tx: UnboundedSender<coord::Command>,
     /// When this server started
@@ -48,16 +52,13 @@ pub struct Server {
 
 impl Server {
     pub fn new(
+        metric_registry: MetricRegistry,
         tls: Option<SslAcceptor>,
         cmdq_tx: UnboundedSender<coord::Command>,
         start_time: Instant,
-        worker_count: &str,
     ) -> Server {
-        // just set this so it shows up in metrics
-        metrics::WORKER_COUNT
-            .with_label_values(&[worker_count])
-            .set(1);
         Server {
+            metrics: Metrics::register_into(&metric_registry),
             tls,
             cmdq_tx,
             start_time,

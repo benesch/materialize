@@ -17,10 +17,8 @@ use byteorder::{ByteOrder, NetworkEndian};
 use futures::sink::{self, SinkExt};
 use futures::stream::{StreamExt, TryStreamExt};
 use itertools::izip;
-use lazy_static::lazy_static;
 use log::{debug, trace};
 use postgres::error::SqlState;
-use prometheus::{register_histogram_vec, register_uint_counter};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::time::{self, Duration};
 use tokio_util::codec::Framed;
@@ -37,6 +35,7 @@ use crate::codec::Codec;
 use crate::message::{
     self, BackendMessage, ErrorSeverity, FrontendMessage, NoticeSeverity, VERSIONS, VERSION_3,
 };
+use crate::metrics::Metrics;
 
 /// Reports whether the given stream begins with a pgwire handshake.
 ///
@@ -58,21 +57,6 @@ pub fn match_handshake(buf: &[u8]) -> bool {
     VERSIONS.contains(&version)
 }
 
-lazy_static! {
-    static ref COMMAND_DURATIONS: prometheus::HistogramVec = register_histogram_vec!(
-        "mz_command_durations",
-        "how long individual commands took",
-        &["command", "status"],
-        ore::stats::HISTOGRAM_BUCKETS.to_vec()
-    )
-    .unwrap();
-    static ref ROWS_RETURNED: prometheus::UIntCounter = register_uint_counter!(
-        "mz_pg_sent_rows",
-        "total number of rows sent to clients from pgwire"
-    )
-    .unwrap();
-}
-
 #[derive(Debug)]
 enum State {
     Ready(Session),
@@ -87,6 +71,7 @@ impl State {
 }
 
 pub struct StateMachine<'a, A> {
+    pub metrics: Metrics,
     pub conn: &'a mut sink::Buffer<Framed<A, Codec>, BackendMessage>,
     pub conn_id: u32,
     pub secret_key: u32,
@@ -176,7 +161,8 @@ where
             State::Ready(_) | State::Done => "success",
             State::Drain(_) => "error",
         };
-        COMMAND_DURATIONS
+        self.metrics
+            .command_durations
             .with_label_values(&[name, status])
             .observe(timer.elapsed().as_secs_f64());
 
@@ -873,7 +859,7 @@ where
             }),
         )
         .await?;
-        ROWS_RETURNED.inc_by(u64::cast_from(nrows));
+        self.metrics.rows_returned.inc_by(u64::cast_from(nrows));
 
         if rows.is_empty() {
             self.send(BackendMessage::CommandComplete {

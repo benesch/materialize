@@ -24,6 +24,7 @@ interchange = { path = "../interchange" }
 itertools = "0.9"
 lazy_static = "1.4"
 log = "0.4"
+metrics = { path = "../metrics" }
 ore = { path = "../ore" }
 pgrepr = { path = "../pgrepr" }
 prometheus = { git = "https://github.com/MaterializeInc/rust-prometheus.git", default-features = false }

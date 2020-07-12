@@ -28,7 +28,7 @@ use futures::executor::block_on;
 use itertools::Itertools;
 use lazy_static::lazy_static;
 use log::{debug, error, info, log_enabled, warn};
-use prometheus::{register_int_gauge_vec, IntGaugeVec};
+use prometheus::IntGaugeVec;
 use rdkafka::consumer::{BaseConsumer, Consumer};
 use rdkafka::message::Message;
 use rdkafka::ClientConfig;
@@ -41,6 +41,7 @@ use dataflow_types::{
     FileSourceConnector, KafkaSourceConnector, KinesisSourceConnector, MzOffset, SourceConnector,
     TimestampSourceUpdate,
 };
+use metrics::{MetricRegistry, metric};
 use expr::{PartitionId, SourceInstanceId};
 use ore::collections::CollectionExt;
 
@@ -104,12 +105,6 @@ lazy_static! {
           "connect.name": "io.debezium.connector.common.TransactionMetadataValue"
         }"#).unwrap()
     };
-
-    static ref MAX_AVAILABLE_OFFSET: IntGaugeVec = register_int_gauge_vec!(
-        "mz_kafka_partition_offset_max",
-        "The high watermark for a partition, the maximum offset that we could hope to ingest",
-        &["topic", "source_id", "partition_id"]
-    ).unwrap();
 }
 
 pub struct TimestampConfig {
@@ -479,6 +474,25 @@ pub struct Timestamper {
 
     /// Frequency at which thread should run
     timestamp_frequency: Duration,
+
+    metrics: Metrics,
+}
+
+#[derive(Clone)]
+struct Metrics {
+    max_available_offset: IntGaugeVec,
+}
+
+impl Metrics {
+    fn register_into(registry: &MetricRegistry) -> Metrics {
+        Metrics {
+            max_available_offset: registry.register(metric!(
+                name: "mz_kafka_partition_offset_max",
+                help: "The high watermark for a partition, the maximum offset that we could hope to ingest",
+                var_labels: ["topic", "source_id", "partition_id"],
+            )),
+        }
+    }
 }
 
 /// A byo record contains a single timestamp update for a given source
@@ -744,6 +758,7 @@ fn identify_consistency_format(enc: DataEncoding, env: Envelope) -> ConsistencyF
 impl Timestamper {
     pub fn new(
         config: &TimestampConfig,
+        metric_registry: &MetricRegistry,
         tx: futures::channel::mpsc::UnboundedSender<coord::Message>,
         rx: std::sync::mpsc::Receiver<TimestampMessage>,
     ) -> Self {
@@ -758,6 +773,7 @@ impl Timestamper {
             tx,
             rx,
             timestamp_frequency: config.frequency,
+            metrics: Metrics::register_into(metric_registry),
         }
     }
 
@@ -1206,8 +1222,9 @@ impl Timestamper {
         );
 
         thread::spawn({
+            let metrics = self.metrics.clone();
             let connector = connector.clone();
-            move || rt_kafka_metadata_fetch_loop(connector, consumer, metadata_refresh_frequency)
+            move || rt_kafka_metadata_fetch_loop(metrics, connector, consumer, metadata_refresh_frequency)
         });
 
         Some(connector)
@@ -1416,7 +1433,7 @@ impl Timestamper {
     }
 }
 
-fn rt_kafka_metadata_fetch_loop(c: RtKafkaConnector, consumer: BaseConsumer, wait: Duration) {
+fn rt_kafka_metadata_fetch_loop(metrics: Metrics, c: RtKafkaConnector, consumer: BaseConsumer, wait: Duration) {
     debug!(
         "Starting realtime Kafka thread for {} (source {})",
         &c.topic, &c.id
@@ -1470,12 +1487,11 @@ fn rt_kafka_metadata_fetch_loop(c: RtKafkaConnector, consumer: BaseConsumer, wai
         for pid in 0..current_partition_count {
             match consumer.fetch_watermarks(&c.topic, pid, Duration::from_secs(30)) {
                 Ok((_low, high)) => {
-                    let max_offset = MAX_AVAILABLE_OFFSET.with_label_values(&[
+                    metrics.max_available_offset.with_label_values(&[
                         &c.topic,
                         &c.id.to_string(),
                         &pid.to_string(),
-                    ]);
-                    max_offset.set(high);
+                    ]).set(high);
                 }
                 Err(e) => {
                     error!(

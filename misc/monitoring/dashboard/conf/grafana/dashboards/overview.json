@@ -312,7 +312,7 @@
       "type": "stat"
     },
     {
-      "content": "Timely Workers: $timely_workers<br/>\nBuilt At: $built_at<br/>\nBuild Version: $build_version<br/>\nBuild sha: $build_sha<br/>",
+      "content": "Timely Workers: $timely_workers<br/>\nBuilt At: $built_at<br/>\nBuild Version: $build_version<br/>\nBuild SHA: $build_sha<br/>",
       "datasource": null,
       "description": "",
       "fieldConfig": {
@@ -2500,16 +2500,16 @@
         "allValue": null,
         "current": {},
         "datasource": "Prometheus",
-        "definition": "label_values(mz_server_metadata_timely_worker_threads, count)",
+        "definition": "query_result(mz_server_metadata_timely_worker_threads)",
         "hide": 2,
         "includeAll": false,
         "label": "Timely Workers",
         "multi": false,
         "name": "timely_workers",
         "options": [],
-        "query": "label_values(mz_server_metadata_timely_worker_threads, count)",
+        "query": "query_result(mz_server_metadata_timely_worker_threads)",
         "refresh": 2,
-        "regex": "",
+        "regex": "/.* ([^\\ ]*) .*/",
         "skipUrlSync": false,
         "sort": 0,
         "tagValuesQuery": "",

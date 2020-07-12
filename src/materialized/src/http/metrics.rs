@@ -17,39 +17,33 @@ use std::time::Instant;
 use askama::Template;
 use futures::future;
 use hyper::{Body, Request, Response};
-use lazy_static::lazy_static;
+use prometheus::proto::MetricFamily;
 use prometheus::{
-    register_gauge_vec, register_int_gauge_vec, Encoder, Gauge, GaugeVec, IntGauge, IntGaugeVec,
+    Encoder, IntGauge, IntGaugeVec,
+    TextEncoder,
 };
+
+use metrics::{metric, MetricRegistry};
 
 use crate::http::{util, Server};
 
-lazy_static! {
-    static ref SERVER_METADATA_RAW: GaugeVec = register_gauge_vec!(
-        "mz_server_metadata_seconds",
-        "server metadata, value is uptime",
-        &["build_time", "build_version", "build_sha"]
-    )
-    .expect("can build mz_server_metadata");
-    static ref SERVER_METADATA: Gauge = SERVER_METADATA_RAW.with_label_values(&[
-        crate::BUILD_TIME,
-        crate::VERSION,
-        crate::BUILD_SHA,
-    ]);
-    pub static ref WORKER_COUNT: IntGaugeVec = register_int_gauge_vec!(
-        "mz_server_metadata_timely_worker_threads",
-        "number of timely workers materialized is running with",
-        &["count"]
-    )
-    .unwrap();
-    static ref REQUEST_TIMES: IntGaugeVec = register_int_gauge_vec!(
-        "mz_server_scrape_metrics_times",
-        "how long it took to gather metrics, used for very low frequency high accuracy measures",
-        &["action"]
-    )
-    .unwrap();
-    static ref REQUEST_METRICS_GATHER: IntGauge = REQUEST_TIMES.with_label_values(&["gather"]);
-    static ref REQUEST_METRICS_ENCODE: IntGauge = REQUEST_TIMES.with_label_values(&["encode"]);
+pub struct Metrics {
+    request_metrics_gather: IntGauge,
+    request_metrics_encode: IntGauge,
+}
+
+impl Metrics {
+    pub fn register_into(registry: &MetricRegistry) -> Metrics {
+        let request_metrics: IntGaugeVec = registry.register(metric!(
+            name: "mz_server_scrape_metrics_times",
+            help: "how long it took to gather metrics",
+            var_labels: ["action"],
+        ));
+        Metrics {
+            request_metrics_gather: request_metrics.with_label_values(&["gather"]),
+            request_metrics_encode: request_metrics.with_label_values(&["encode"]),
+        }
+    }
 }
 
 #[derive(Template)]
@@ -66,24 +60,23 @@ impl Server {
         &self,
         _: Request<Body>,
     ) -> impl Future<Output = anyhow::Result<Response<Body>>> {
-        let metric_families = load_prom_metrics(self.start_time);
-        async move {
-            let encoder = prometheus::TextEncoder::new();
-            let mut buffer = Vec::new();
-
-            let start = Instant::now();
-            encoder.encode(&metric_families, &mut buffer)?;
-            REQUEST_METRICS_ENCODE.set(Instant::now().duration_since(start).as_micros() as i64);
-
-            Ok(Response::new(Body::from(buffer)))
-        }
+        let metric_families = self.gather_metrics();
+        let mut buffer = Vec::new();
+        let start = Instant::now();
+        TextEncoder::new()
+            .encode(&metric_families, &mut buffer)
+            .expect("writing to vec cannot fail");
+        self.metrics
+            .request_metrics_encode
+            .set(start.elapsed().as_micros() as i64);
+        future::ok(Response::new(Body::from(buffer)))
     }
 
     pub fn handle_status(
         &self,
         _: Request<Body>,
     ) -> impl Future<Output = anyhow::Result<Response<Body>>> {
-        let metric_families = load_prom_metrics(self.start_time);
+        let metric_families = self.gather_metrics();
 
         let desired_metrics = {
             let mut s = BTreeSet::new();
@@ -159,18 +152,15 @@ impl Server {
             metrics: metrics.values().collect(),
         }))
     }
-}
 
-/// Call [`prometheus::gather`], ensuring that all our metrics are up to date
-fn load_prom_metrics(start_time: Instant) -> Vec<prometheus::proto::MetricFamily> {
-    let before_gather = Instant::now();
-    let uptime = before_gather - start_time;
-    let (secs, milli_part) = (uptime.as_secs() as f64, uptime.subsec_millis() as f64);
-    SERVER_METADATA.set(secs + milli_part / 1_000.0);
-    let result = prometheus::gather();
-
-    REQUEST_METRICS_GATHER.set(Instant::now().duration_since(before_gather).as_micros() as i64);
-    result
+    fn gather_metrics(&self) -> Vec<MetricFamily> {
+        let start = Instant::now();
+        let metrics = prometheus::gather();
+        self.metrics
+            .request_metrics_gather
+            .set(start.elapsed().as_micros() as i64);
+        metrics
+    }
 }
 
 #[derive(Debug)]

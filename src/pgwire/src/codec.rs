@@ -21,9 +21,7 @@ use std::str;
 
 use byteorder::{ByteOrder, NetworkEndian};
 use bytes::{Buf, BufMut, BytesMut};
-use lazy_static::lazy_static;
 use postgres::error::SqlState;
-use prometheus::{register_uint_counter, UIntCounter};
 use tokio::io::{self, AsyncRead, AsyncReadExt};
 use tokio_util::codec::{Decoder, Encoder};
 
@@ -34,14 +32,7 @@ use crate::message::{
     BackendMessage, FrontendMessage, FrontendStartupMessage, TransactionStatus, VERSION_CANCEL,
     VERSION_GSSENC, VERSION_SSL,
 };
-
-lazy_static! {
-    static ref BYTES_SENT: UIntCounter = register_uint_counter!(
-        "mz_pg_sent_bytes",
-        "total number of bytes sent to clients from pgwire"
-    )
-    .unwrap();
-}
+use crate::metrics::Metrics;
 
 pub const REJECT_ENCRYPTION: u8 = b'N';
 pub const ACCEPT_SSL_ENCRYPTION: u8 = b'S';
@@ -80,14 +71,16 @@ impl fmt::Display for CodecError {
 /// }
 /// ```
 pub struct Codec {
+    metrics: Metrics,
     decode_state: DecodeState,
     encode_state: Vec<(pgrepr::Type, pgrepr::Format)>,
 }
 
 impl Codec {
     /// Creates a new `Codec`.
-    pub fn new() -> Codec {
+    pub fn new(metrics: Metrics) -> Codec {
         Codec {
+            metrics,
             decode_state: DecodeState::Head,
             encode_state: vec![],
         }
@@ -120,12 +113,6 @@ impl Codec {
             dst.put_string(hint);
         }
         dst.put_u8(b'\0');
-    }
-}
-
-impl Default for Codec {
-    fn default() -> Codec {
-        Codec::new()
     }
 }
 
@@ -277,7 +264,9 @@ impl Encoder<BackendMessage> for Codec {
 
         let len = dst.len() - base;
         // TODO: consider finding some way to not do this per-row
-        BYTES_SENT.inc_by(u64::cast_from(dst.len() - base));
+        self.metrics
+            .bytes_sent
+            .inc_by(u64::cast_from(dst.len() - base));
 
         // Overwrite length placeholder with true length.
         let len = i32::try_from(len).map_err(|_| {

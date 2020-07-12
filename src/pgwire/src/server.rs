@@ -19,14 +19,17 @@ use tokio_openssl::SslStream;
 use tokio_util::codec::Framed;
 
 use coord::session::Session;
+use metrics::MetricRegistry;
 
 use crate::codec::{self, Codec, ACCEPT_SSL_ENCRYPTION, REJECT_ENCRYPTION};
 use crate::id_alloc::{IdAllocator, IdExhaustionError};
 use crate::message::FrontendStartupMessage;
+use crate::metrics::Metrics;
 use crate::protocol::StateMachine;
 use crate::secrets::SecretManager;
 
 pub struct Server {
+    metrics: Metrics,
     id_alloc: IdAllocator,
     secrets: SecretManager,
     tls: Option<SslAcceptor>,
@@ -35,10 +38,13 @@ pub struct Server {
 
 impl Server {
     pub fn new(
+        metric_registry: &MetricRegistry,
         tls: Option<SslAcceptor>,
         cmdq_tx: futures::channel::mpsc::UnboundedSender<coord::Command>,
     ) -> Server {
+        let metrics = Metrics::register_into(metric_registry);
         Server {
+            metrics,
             id_alloc: IdAllocator::new(1, 1 << 16),
             secrets: SecretManager::new(),
             tls,
@@ -62,8 +68,10 @@ impl Server {
                     };
                     self.secrets.generate(conn_id);
 
+                    let codec = Codec::new(self.metrics.clone());
                     let mut machine = StateMachine {
-                        conn: &mut Framed::new(conn, Codec::new()).buffer(32),
+                        metrics: self.metrics.clone(),
+                        conn: &mut Framed::new(conn, codec).buffer(32),
                         conn_id,
                         secret_key: self.secrets.get(conn_id).unwrap(),
                         cmdq_tx: self.cmdq_tx.clone(),
