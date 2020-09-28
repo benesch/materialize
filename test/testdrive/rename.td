@@ -31,7 +31,7 @@ $ avro-ocf-write path=data.ocf schema=${writer-schema} codec=null
     SELECT * FROM mz_data
 
 > SHOW INDEXES FROM mz_view
-Source_or_view                Key_name                              Column_name  Expression  Null   Seq_in_index
+On_name                       Key_name                              Column_name  Expression  Null   Seq_in_index
 ----------------------------------------------------------------------------------------------------------------
 materialize.public.mz_view  materialize.public.mz_view_primary_idx  a            <null>      false             1
 materialize.public.mz_view  materialize.public.mz_view_primary_idx  b            <null>      false             2
@@ -49,13 +49,73 @@ materialize.public.mz_view  materialize.public.mz_view_primary_idx  mz_obj_no   
     "materialize"."public"."mz_data"
     ';
 
+> SELECT name FROM mz_catalog_names WHERE name LIKE '%materialize.public.mz_data%';
+name
+-----
+materialize.public.mz_data
+materialize.public.mz_data_primary_idx
+
 > ALTER SOURCE mz_data RENAME TO renamed_mz_data;
+
+> SELECT name FROM mz_catalog_names WHERE name LIKE '%materialize.public.mz_data%';
+name
+-----
+materialize.public.mz_data_primary_idx
+
+> SELECT name FROM mz_catalog_names WHERE name LIKE '%materialize.public.renamed_mz_data%';
+name
+-----
+materialize.public.renamed_mz_data
+
+> SELECT name FROM mz_catalog_names WHERE name LIKE '%materialize.public.mz_view%';
+name
+-----
+materialize.public.mz_view
+materialize.public.mz_view_primary_idx
 
 > ALTER VIEW mz_view RENAME TO renamed_mz_view;
 
+> SELECT name FROM mz_catalog_names WHERE name LIKE '%materialize.public.mz_view%';
+name
+-----
+materialize.public.mz_view_primary_idx
+
+> SELECT name FROM mz_catalog_names WHERE name LIKE '%materialize.public.renamed_mz_view%';
+name
+-----
+materialize.public.renamed_mz_view
+
+> SELECT name FROM mz_catalog_names WHERE name LIKE '%materialize.public.mz_view_primary_idx%';
+name
+-----
+materialize.public.mz_view_primary_idx
+
 > ALTER INDEX mz_view_primary_idx RENAME TO renamed_index;
 
+> SELECT name FROM mz_catalog_names WHERE name LIKE '%materialize.public.mz_view_primary_idx%';
+name
+-----
+
+> SELECT name FROM mz_catalog_names WHERE name LIKE '%materialize.public.renamed_index%';
+name
+-----
+materialize.public.renamed_index
+
+> SELECT name FROM mz_catalog_names WHERE name LIKE '%materialize.public.sink1%';
+name
+-----
+materialize.public.sink1
+
 > ALTER SINK sink1 RENAME TO renamed_sink
+
+> SELECT name FROM mz_catalog_names WHERE name LIKE '%materialize.public.sink1%';
+name
+-----
+
+> SELECT name FROM mz_catalog_names WHERE name LIKE '%materialize.public.renamed_sink%';
+name
+-----
+materialize.public.renamed_sink
 
 # Source was successfully renamed
 > SHOW SOURCES;
@@ -86,7 +146,7 @@ materialize.public.renamed_mz_view  "CREATE VIEW \"materialize\".\"public\".\"re
 
 # Item's indexes are properly re-attributed
 > SHOW INDEXES FROM renamed_mz_view
-Source_or_view                      Key_name                          Column_name Expression Null  Seq_in_index
+On_name                             Key_name                          Column_name Expression Null  Seq_in_index
 ---------------------------------------------------------------------------------------------------------------
  materialize.public.renamed_mz_view materialize.public.renamed_index  a           <null>     false            1
  materialize.public.renamed_mz_view materialize.public.renamed_index  b           <null>     false            2
@@ -673,3 +733,22 @@ materialize.public.count "CREATE VIEW \"materialize\".\"public\".\"count\" AS SE
 > DROP VIEW count CASCADE;
 
 > CREATE VIEW count AS SELECT 1
+
+> CREATE TABLE j (b int)
+
+> SHOW TABLES
+TABLES
+----
+j
+
+> ALTER TABLE j RENAME TO renamed_j
+
+> SHOW TABLES
+TABLES
+----
+renamed_j
+
+> SELECT tables FROM mz_tables WHERE global_id like 'u%';
+tables
+----
+renamed_j

@@ -3,62 +3,82 @@
 // Use of this software is governed by the Apache License, Version 2.0
 
 use std::cmp;
-use std::collections::HashMap;
 use std::fmt::{self, Display};
 use std::fs::File;
 use std::io::{self, Cursor, Read, Seek, SeekFrom};
-use std::mem::transmute;
 
-use anyhow::{bail, Error};
 use chrono::{NaiveDate, NaiveDateTime};
 
+use crate::error::{DecodeError, Error as AvroError};
 use crate::schema::{
     RecordField, ResolvedDefaultValueField, ResolvedRecordField, SchemaNode, SchemaPiece,
     SchemaPieceOrNamed,
 };
-use crate::types::{DecimalValue, Scalar, Value};
-use crate::util::{safe_len, zag_i32, zag_i64, DecodeError};
+use crate::types::{Scalar, Value};
+use crate::{
+    util::{safe_len, zag_i32, zag_i64, TsUnit},
+    TrivialDecoder, ValueDecoder,
+};
 
+pub trait StatefulAvroDecodeable: Sized {
+    type Decoder: AvroDecode<Out = Self>;
+    type State;
+    fn new_decoder(state: Self::State) -> Self::Decoder;
+}
+pub trait AvroDecodeable: Sized {
+    type Decoder: AvroDecode<Out = Self>;
+
+    fn new_decoder() -> Self::Decoder;
+}
+impl<T> AvroDecodeable for T
+where
+    T: StatefulAvroDecodeable,
+    T::State: Default,
+{
+    type Decoder = <Self as StatefulAvroDecodeable>::Decoder;
+
+    fn new_decoder() -> Self::Decoder {
+        <Self as StatefulAvroDecodeable>::new_decoder(Default::default())
+    }
+}
 #[inline]
-fn decode_long_nonneg<R: Read>(reader: &mut R) -> Result<u64, Error> {
+fn decode_long_nonneg<R: Read>(reader: &mut R) -> Result<u64, AvroError> {
     let u = match zag_i64(reader)? {
         i if i >= 0 => i as u64,
-        i => bail!("Expected non-negative integer, got {}", i),
+        i => return Err(AvroError::Decode(DecodeError::ExpectedNonnegInteger(i))),
     };
     Ok(u)
 }
 
-fn decode_int_nonneg<R: Read>(reader: &mut R) -> Result<u32, Error> {
+fn decode_int_nonneg<R: Read>(reader: &mut R) -> Result<u32, AvroError> {
     let u = match zag_i32(reader)? {
         i if i >= 0 => i as u32,
-        i => bail!("Expected non-negative integer, got {}", i),
+        i => {
+            return Err(AvroError::Decode(DecodeError::ExpectedNonnegInteger(
+                i as i64,
+            )))
+        }
     };
     Ok(u)
 }
 
 #[inline]
-fn decode_len<R: Read>(reader: &mut R) -> Result<usize, Error> {
+fn decode_len<R: Read>(reader: &mut R) -> Result<usize, AvroError> {
     zag_i64(reader).and_then(|i| safe_len(i as usize))
 }
 
 #[inline]
-fn decode_float<R: Read>(reader: &mut R) -> Result<f32, Error> {
+fn decode_float<R: Read>(reader: &mut R) -> Result<f32, AvroError> {
     let mut buf = [0u8; 4];
     reader.read_exact(&mut buf[..])?;
-    Ok(unsafe { transmute::<[u8; 4], f32>(buf) })
+    Ok(f32::from_le_bytes(buf))
 }
 
 #[inline]
-fn decode_double<R: Read>(reader: &mut R) -> Result<f64, Error> {
+fn decode_double<R: Read>(reader: &mut R) -> Result<f64, AvroError> {
     let mut buf = [0u8; 8];
     reader.read_exact(&mut buf[..])?;
-    Ok(unsafe { transmute::<[u8; 8], f64>(buf) })
-}
-
-#[derive(Debug, Clone, Copy)]
-enum TsUnit {
-    Millis,
-    Micros,
+    Ok(f64::from_le_bytes(buf))
 }
 
 impl Display for TsUnit {
@@ -70,7 +90,7 @@ impl Display for TsUnit {
     }
 }
 
-fn build_ts_value(value: i64, unit: TsUnit) -> Result<Value, Error> {
+fn build_ts_value(value: i64, unit: TsUnit) -> Result<Value, AvroError> {
     let units_per_second = match unit {
         TsUnit::Millis => 1_000,
         TsUnit::Micros => 1_000_000,
@@ -79,12 +99,13 @@ fn build_ts_value(value: i64, unit: TsUnit) -> Result<Value, Error> {
     let seconds = value / units_per_second;
     let fraction = (value % units_per_second) as u32;
     Ok(Value::Timestamp(
-        NaiveDateTime::from_timestamp_opt(seconds, fraction * nanos_per_unit).ok_or_else(|| {
-            DecodeError::new(format!(
-                "Invalid {} timestamp {}.{}",
-                unit, seconds, fraction
-            ))
-        })?,
+        NaiveDateTime::from_timestamp_opt(seconds, fraction * nanos_per_unit).ok_or(
+            AvroError::Decode(DecodeError::BadTimestamp {
+                unit,
+                seconds,
+                fraction,
+            }),
+        )?,
     ))
 }
 
@@ -155,10 +176,10 @@ pub struct AvroFieldAccess<'b, R: AvroRead> {
 }
 
 impl<'b, R: AvroRead> AvroFieldAccess<'b, R> {
-    pub fn decode_field<D: AvroDecode>(self, d: D) -> Result<D::Out, Error> {
+    pub fn decode_field<D: AvroDecode>(self, d: D) -> Result<D::Out, AvroError> {
         match self.schema {
             SchemaOrDefault::Schema(r, schema) => {
-                let mut des = GeneralDeserializer { schema };
+                let des = GeneralDeserializer { schema };
                 des.deserialize(r, d)
             }
             SchemaOrDefault::Default(value) => give_value(d, value),
@@ -169,7 +190,7 @@ impl<'b, R: AvroRead> AvroFieldAccess<'b, R> {
 pub trait AvroRecordAccess<R: AvroRead> {
     fn next_field<'b>(
         &'b mut self,
-    ) -> Result<Option<(&'b str, usize, AvroFieldAccess<'b, R>)>, Error>;
+    ) -> Result<Option<(&'b str, usize, AvroFieldAccess<'b, R>)>, AvroError>;
 }
 
 struct SimpleRecordAccess<'a, R: AvroRead> {
@@ -193,7 +214,7 @@ impl<'a, R: AvroRead> SimpleRecordAccess<'a, R> {
 impl<'a, R: AvroRead> AvroRecordAccess<R> for SimpleRecordAccess<'a, R> {
     fn next_field<'b>(
         &'b mut self,
-    ) -> Result<Option<(&'b str, usize, AvroFieldAccess<'b, R>)>, Error> {
+    ) -> Result<Option<(&'b str, usize, AvroFieldAccess<'b, R>)>, AvroError> {
         assert!(self.i <= self.fields.len());
         if self.i == self.fields.len() {
             Ok(None)
@@ -225,7 +246,7 @@ impl<'a> ValueRecordAccess<'a> {
 impl<'a> AvroRecordAccess<&'a [u8]> for ValueRecordAccess<'a> {
     fn next_field<'b>(
         &'b mut self,
-    ) -> Result<Option<(&'b str, usize, AvroFieldAccess<'b, &'a [u8]>)>, Error> {
+    ) -> Result<Option<(&'b str, usize, AvroFieldAccess<'b, &'a [u8]>)>, AvroError> {
         assert!(self.i <= self.values.len());
         if self.i == self.values.len() {
             Ok(None)
@@ -258,7 +279,7 @@ impl<'a> AvroMapAccess for ValueMapAccess<'a> {
     type R = &'a [u8];
     fn next_entry<'b>(
         &'b mut self,
-    ) -> Result<Option<(String, AvroFieldAccess<'b, Self::R>)>, Error> {
+    ) -> Result<Option<(String, AvroFieldAccess<'b, Self::R>)>, AvroError> {
         assert!(self.i <= self.values.len());
         if self.i == self.values.len() {
             Ok(None)
@@ -305,7 +326,7 @@ impl<'a, R: AvroRead> ResolvedRecordAccess<'a, R> {
 impl<'a, R: AvroRead> AvroRecordAccess<R> for ResolvedRecordAccess<'a, R> {
     fn next_field<'b>(
         &'b mut self,
-    ) -> Result<Option<(&'b str, usize, AvroFieldAccess<'b, R>)>, Error> {
+    ) -> Result<Option<(&'b str, usize, AvroFieldAccess<'b, R>)>, AvroError> {
         assert!(self.i_defaults <= self.defaults.len() && self.i_fields <= self.fields.len());
         if self.i_defaults < self.defaults.len() {
             let default = &self.defaults[self.i_defaults];
@@ -324,7 +345,7 @@ impl<'a, R: AvroRead> AvroRecordAccess<R> for ResolvedRecordAccess<'a, R> {
                 match field {
                     ResolvedRecordField::Absent(absent_schema) => {
                         // we don't care what's in the value, but we still need to read it in order to skip ahead the proper amount in the input.
-                        let mut d = GeneralDeserializer {
+                        let d = GeneralDeserializer {
                             schema: absent_schema.top_node(),
                         };
                         d.deserialize(self.r, TrivialDecoder)?;
@@ -350,14 +371,14 @@ impl<'a, R: AvroRead> AvroRecordAccess<R> for ResolvedRecordAccess<'a, R> {
 }
 
 pub trait AvroArrayAccess {
-    fn decode_next<D: AvroDecode>(&mut self, d: D) -> Result<Option<D::Out>, Error>;
+    fn decode_next<D: AvroDecode>(&mut self, d: D) -> Result<Option<D::Out>, AvroError>;
 }
 
 pub trait AvroMapAccess {
     type R: AvroRead;
     fn next_entry<'b>(
         &'b mut self,
-    ) -> Result<Option<(String, AvroFieldAccess<'b, Self::R>)>, Error>;
+    ) -> Result<Option<(String, AvroFieldAccess<'b, Self::R>)>, AvroError>;
 }
 
 pub struct SimpleMapAccess<'a, R: AvroRead> {
@@ -380,7 +401,7 @@ impl<'a, R: AvroRead> SimpleMapAccess<'a, R> {
 
 impl<'a, R: AvroRead> AvroMapAccess for SimpleMapAccess<'a, R> {
     type R = R;
-    fn next_entry<'b>(&'b mut self) -> Result<Option<(String, AvroFieldAccess<'b, R>)>, Error> {
+    fn next_entry<'b>(&'b mut self) -> Result<Option<(String, AvroFieldAccess<'b, R>)>, AvroError> {
         if self.done {
             return Ok(None);
         }
@@ -406,7 +427,8 @@ impl<'a, R: AvroRead> AvroMapAccess for SimpleMapAccess<'a, R> {
         let mut key_buf = vec![];
         key_buf.resize_with(key_len, Default::default);
         self.r.read_exact(&mut key_buf)?;
-        let key = String::from_utf8(key_buf)?;
+        let key = String::from_utf8(key_buf)
+            .map_err(|_e| AvroError::Decode(DecodeError::MapKeyUtf8Error))?;
 
         let a = AvroFieldAccess {
             schema: SchemaOrDefault::Schema(self.r, self.entry_schema),
@@ -445,7 +467,7 @@ impl<'a> ValueArrayAccess<'a> {
 }
 
 impl<'a> AvroArrayAccess for ValueArrayAccess<'a> {
-    fn decode_next<D: AvroDecode>(&mut self, d: D) -> Result<Option<D::Out>, Error> {
+    fn decode_next<D: AvroDecode>(&mut self, d: D) -> Result<Option<D::Out>, AvroError> {
         assert!(self.i <= self.values.len());
         if self.i == self.values.len() {
             Ok(None)
@@ -458,7 +480,7 @@ impl<'a> AvroArrayAccess for ValueArrayAccess<'a> {
 }
 
 impl<'a, R: AvroRead> AvroArrayAccess for SimpleArrayAccess<'a, R> {
-    fn decode_next<D: AvroDecode>(&mut self, d: D) -> Result<Option<D::Out>, Error> {
+    fn decode_next<D: AvroDecode>(&mut self, d: D) -> Result<Option<D::Out>, AvroError> {
         if self.done {
             return Ok(None);
         }
@@ -477,157 +499,662 @@ impl<'a, R: AvroRead> AvroArrayAccess for SimpleArrayAccess<'a, R> {
         }
         assert!(self.remaining > 0);
         self.remaining -= 1;
-        let mut des = GeneralDeserializer {
+        let des = GeneralDeserializer {
             schema: self.schema,
         };
         des.deserialize(self.r, d).map(Some)
     }
 }
 
+#[macro_export]
+macro_rules! define_unexpected {
+    (record) => {
+        fn record<R: $crate::AvroRead, A: $crate::AvroRecordAccess<R>>(
+            self,
+            _a: &mut A,
+        ) -> Result<Self::Out, $crate::error::Error> {
+            Err($crate::error::Error::Decode($crate::error::DecodeError::UnexpectedRecord))
+        }
+    };
+    (union_branch) => {
+        fn union_branch<'avro_macro_lifetime, R: $crate::AvroRead, D: $crate::AvroDeserializer>(
+            self,
+            _idx: usize,
+            _n_variants: usize,
+            _null_variant: Option<usize>,
+            _deserializer: D,
+            _reader: &'avro_macro_lifetime mut R,
+        ) -> Result<Self::Out, $crate::error::Error> {
+            Err($crate::error::Error::Decode($crate::error::DecodeError::UnexpectedUnion))
+        }
+    };
+    (array) => {
+        fn array<A: $crate::AvroArrayAccess>(self, _a: &mut A) -> Result<Self::Out, $crate::error::Error> {
+            Err($crate::error::Error::Decode($crate::error::DecodeError::UnexpectedArray))
+        }
+    };
+    (map) => {
+        fn map<M: $crate::AvroMapAccess>(self, _m: &mut M) -> Result<Self::Out, $crate::error::Error> {
+            Err($crate::error::Error::Decode($crate::error::DecodeError::UnexpectedMap))
+        }
+    };
+    (enum_variant) => {
+        fn enum_variant(self, _symbol: &str, _idx: usize) -> Result<Self::Out, $crate::error::Error> {
+            Err($crate::error::Error::Decode($crate::error::DecodeError::UnexpectedEnum))
+        }
+    };
+    (scalar) => {
+        fn scalar(self, _scalar: $crate::types::Scalar) -> Result<Self::Out, $crate::error::Error> {
+            Err($crate::error::Error::Decode($crate::error::DecodeError::UnexpectedScalar))
+        }
+    };
+    (decimal) => {
+        fn decimal<'avro_macro_lifetime, R: AvroRead>(
+            self,
+            _precision: usize,
+            _scale: usize,
+            _r: $crate::ValueOrReader<'avro_macro_lifetime, &'avro_macro_lifetime [u8], R>,
+        ) -> Result<Self::Out, $crate::error::Error> {
+            Err($crate::error::Error::Decode($crate::error::DecodeError::UnexpectedDecimal))
+        }
+    };
+    (bytes) => {
+        fn bytes<'avro_macro_lifetime, R: AvroRead>(
+            self,
+            _r: $crate::ValueOrReader<'avro_macro_lifetime, &'avro_macro_lifetime [u8], R>,
+        ) -> Result<Self::Out, $crate::error::Error> {
+            Err($crate::error::Error::Decode($crate::error::DecodeError::UnexpectedBytes))
+        }
+    };
+    (string) => {
+        fn string<'avro_macro_lifetime, R: AvroRead>(
+            self,
+            _r: $crate::ValueOrReader<'avro_macro_lifetime, &'avro_macro_lifetime str, R>,
+        ) -> Result<Self::Out, $crate::error::Error> {
+            Err($crate::error::Error::Decode($crate::error::DecodeError::UnexpectedString))
+        }
+    };
+    (json) => {
+        fn json<'avro_macro_lifetime, R: AvroRead>(
+            self,
+            _r: $crate::ValueOrReader<'avro_macro_lifetime, &'avro_macro_lifetime serde_json::Value, R>,
+        ) -> Result<Self::Out, $crate::error::Error> {
+            Err($crate::error::Error::Decode($crate::error::DecodeError::UnexpectedJson))
+        }
+    };
+    (uuid) => {
+        fn uuid<'avro_macro_lifetime, R: AvroRead>(
+            self,
+            _r: $crate::ValueOrReader<'avro_macro_lifetime, &'avro_macro_lifetime [u8], R>,
+        ) -> Result<Self::Out, $crate::error::Error> {
+            Err($crate::error::Error::Decode($crate::error::DecodeError::UnexpectedUuid))
+        }
+    };
+    (fixed) => {
+        fn fixed<'avro_macro_lifetime, R: AvroRead>(
+            self,
+            _r: $crate::ValueOrReader<'avro_macro_lifetime, &'avro_macro_lifetime [u8], R>,
+        ) -> Result<Self::Out, $crate::error::Error> {
+            Err($crate::error::Error::Decode($crate::error::DecodeError::UnexpectedFixed))
+        }
+    };
+    ($($kind:ident),+) => {
+        $($crate::define_unexpected!{$kind})+
+    }
+}
+
 pub trait AvroDecode: Sized {
     type Out;
-    fn record<R: AvroRead, A: AvroRecordAccess<R>>(self, _a: &mut A) -> Result<Self::Out, Error> {
-        bail!("Unexpected record");
-    }
+    fn record<R: AvroRead, A: AvroRecordAccess<R>>(
+        self,
+        _a: &mut A,
+    ) -> Result<Self::Out, AvroError>;
 
     fn union_branch<'a, R: AvroRead, D: AvroDeserializer>(
         self,
         _idx: usize,
         _n_variants: usize,
         _null_variant: Option<usize>,
-        _deserializer: &'a mut D,
+        _deserializer: D,
         _reader: &'a mut R,
-    ) -> Result<Self::Out, Error> {
-        bail!("Unexpected union");
-    }
+    ) -> Result<Self::Out, AvroError>;
 
-    fn array<A: AvroArrayAccess>(self, _a: &mut A) -> Result<Self::Out, Error> {
-        bail!("Unexpected array");
-    }
+    fn array<A: AvroArrayAccess>(self, _a: &mut A) -> Result<Self::Out, AvroError>;
 
-    fn map<M: AvroMapAccess>(self, _m: &mut M) -> Result<Self::Out, Error> {
-        bail!("Unexpected map");
-    }
+    fn map<M: AvroMapAccess>(self, _m: &mut M) -> Result<Self::Out, AvroError>;
 
-    fn enum_variant(self, _symbol: &str, _idx: usize) -> Result<Self::Out, Error> {
-        bail!("Unexpected enum");
-    }
+    fn enum_variant(self, _symbol: &str, _idx: usize) -> Result<Self::Out, AvroError>;
 
-    fn scalar(self, _scalar: Scalar) -> Result<Self::Out, Error> {
-        bail!("Unexpected scalar");
-    }
+    fn scalar(self, _scalar: Scalar) -> Result<Self::Out, AvroError>;
 
     fn decimal<'a, R: AvroRead>(
         self,
         _precision: usize,
         _scale: usize,
         _r: ValueOrReader<'a, &'a [u8], R>,
-    ) -> Result<Self::Out, Error> {
-        bail!("Unexpected decimal");
-    }
+    ) -> Result<Self::Out, AvroError>;
     fn bytes<'a, R: AvroRead>(
         self,
         _r: ValueOrReader<'a, &'a [u8], R>,
-    ) -> Result<Self::Out, Error> {
-        bail!("Unexpected bytes");
-    }
+    ) -> Result<Self::Out, AvroError>;
     fn string<'a, R: AvroRead>(
         self,
         _r: ValueOrReader<'a, &'a str, R>,
-    ) -> Result<Self::Out, Error> {
-        bail!("Unexpected string");
-    }
+    ) -> Result<Self::Out, AvroError>;
     fn json<'a, R: AvroRead>(
         self,
         _r: ValueOrReader<'a, &'a serde_json::Value, R>,
-    ) -> Result<Self::Out, Error> {
-        bail!("Unexpected json");
-    }
+    ) -> Result<Self::Out, AvroError>;
+    fn uuid<'a, R: AvroRead>(
+        self,
+        _r: ValueOrReader<'a, &'a [u8], R>,
+    ) -> Result<Self::Out, AvroError>;
     fn fixed<'a, R: AvroRead>(
         self,
         _r: ValueOrReader<'a, &'a [u8], R>,
-    ) -> Result<Self::Out, Error> {
-        bail!("Unexpected fixed");
+    ) -> Result<Self::Out, AvroError>;
+    fn map_decoder<T, F: FnMut(Self::Out) -> Result<T, AvroError>>(
+        self,
+        f: F,
+    ) -> public_decoders::MappingDecoder<T, Self::Out, Self, F> {
+        public_decoders::MappingDecoder::new(self, f)
     }
 }
 
-pub struct TrivialDecoder;
+pub mod public_decoders {
 
-impl TrivialDecoder {
-    fn maybe_skip<'a, V, R: AvroRead>(self, r: ValueOrReader<'a, V, R>) -> Result<(), Error> {
-        if let ValueOrReader::Reader { len, r } = r {
-            Ok(r.skip(len)?)
-        } else {
+    use super::{AvroDecodeable, AvroMapAccess, StatefulAvroDecodeable};
+    use crate::error::{DecodeError, Error as AvroError};
+    use crate::types::{DecimalValue, Scalar, Value};
+    use crate::{
+        AvroArrayAccess, AvroDecode, AvroDeserializer, AvroRead, AvroRecordAccess, ValueOrReader,
+    };
+    use std::collections::HashMap;
+
+    macro_rules! define_simple_decoder {
+        ($name:ident, $out:ty, $($scalar_branch:ident);*) => {
+            pub struct $name;
+            impl AvroDecode for $name {
+                type Out = $out;
+                fn scalar(self, scalar: Scalar) -> Result<$out, AvroError> {
+                    use std::convert::TryInto;
+                    let out = match scalar {
+                        $(
+                            Scalar::$scalar_branch(inner) => {inner.try_into()?}
+                        ),*
+                            other => return Err(AvroError::Decode(DecodeError::UnexpectedScalarKind(other.into())))
+                    };
+                    Ok(out)
+                }
+                define_unexpected! {
+                    array, record, union_branch, map, enum_variant, decimal, bytes, string, json, uuid, fixed
+                }
+            }
+
+            impl StatefulAvroDecodeable for $out {
+                type Decoder = $name;
+                type State = ();
+                fn new_decoder(_state: ()) -> $name {
+                    $name
+                }
+            }
+        }
+    }
+
+    define_simple_decoder!(I32Decoder, i32, Int;Long);
+    define_simple_decoder!(I64Decoder, i64, Int;Long);
+    define_simple_decoder!(U64Decoder, u64, Int;Long);
+    define_simple_decoder!(UsizeDecoder, usize, Int;Long);
+    define_simple_decoder!(IsizeDecoder, isize, Int;Long);
+
+    pub struct MappingDecoder<
+        T,
+        InnerOut,
+        Inner: AvroDecode<Out = InnerOut>,
+        Conv: FnMut(InnerOut) -> Result<T, AvroError>,
+    > {
+        inner: Inner,
+        conv: Conv,
+    }
+
+    impl<
+            T,
+            InnerOut,
+            Inner: AvroDecode<Out = InnerOut>,
+            Conv: FnMut(InnerOut) -> Result<T, AvroError>,
+        > MappingDecoder<T, InnerOut, Inner, Conv>
+    {
+        pub fn new(inner: Inner, conv: Conv) -> Self {
+            Self { inner, conv }
+        }
+    }
+
+    impl<
+            T,
+            InnerOut,
+            Inner: AvroDecode<Out = InnerOut>,
+            Conv: FnMut(InnerOut) -> Result<T, AvroError>,
+        > AvroDecode for MappingDecoder<T, InnerOut, Inner, Conv>
+    {
+        type Out = T;
+
+        fn record<R: AvroRead, A: AvroRecordAccess<R>>(
+            mut self,
+            a: &mut A,
+        ) -> Result<Self::Out, AvroError> {
+            Ok((self.conv)(self.inner.record(a)?)?)
+        }
+
+        fn union_branch<'a, R: AvroRead, D: AvroDeserializer>(
+            mut self,
+            idx: usize,
+            n_variants: usize,
+            null_variant: Option<usize>,
+            deserializer: D,
+            reader: &'a mut R,
+        ) -> Result<Self::Out, AvroError> {
+            Ok((self.conv)(self.inner.union_branch(
+                idx,
+                n_variants,
+                null_variant,
+                deserializer,
+                reader,
+            )?)?)
+        }
+
+        fn array<A: AvroArrayAccess>(mut self, a: &mut A) -> Result<Self::Out, AvroError> {
+            Ok((self.conv)(self.inner.array(a)?)?)
+        }
+
+        fn map<M: AvroMapAccess>(mut self, m: &mut M) -> Result<Self::Out, AvroError> {
+            Ok((self.conv)(self.inner.map(m)?)?)
+        }
+
+        fn enum_variant(mut self, symbol: &str, idx: usize) -> Result<Self::Out, AvroError> {
+            Ok((self.conv)(self.inner.enum_variant(symbol, idx)?)?)
+        }
+
+        fn scalar(mut self, scalar: Scalar) -> Result<Self::Out, AvroError> {
+            Ok((self.conv)(self.inner.scalar(scalar)?)?)
+        }
+
+        fn decimal<'a, R: AvroRead>(
+            mut self,
+            precision: usize,
+            scale: usize,
+            r: ValueOrReader<'a, &'a [u8], R>,
+        ) -> Result<Self::Out, AvroError> {
+            Ok((self.conv)(self.inner.decimal(precision, scale, r)?)?)
+        }
+
+        fn bytes<'a, R: AvroRead>(
+            mut self,
+            r: ValueOrReader<'a, &'a [u8], R>,
+        ) -> Result<Self::Out, AvroError> {
+            Ok((self.conv)(self.inner.bytes(r)?)?)
+        }
+
+        fn string<'a, R: AvroRead>(
+            mut self,
+            r: ValueOrReader<'a, &'a str, R>,
+        ) -> Result<Self::Out, AvroError> {
+            Ok((self.conv)(self.inner.string(r)?)?)
+        }
+
+        fn json<'a, R: AvroRead>(
+            mut self,
+            r: ValueOrReader<'a, &'a serde_json::Value, R>,
+        ) -> Result<Self::Out, AvroError> {
+            Ok((self.conv)(self.inner.json(r)?)?)
+        }
+
+        fn uuid<'a, R: AvroRead>(
+            mut self,
+            r: ValueOrReader<'a, &'a [u8], R>,
+        ) -> Result<Self::Out, AvroError> {
+            Ok((self.conv)(self.inner.uuid(r)?)?)
+        }
+
+        fn fixed<'a, R: AvroRead>(
+            mut self,
+            r: ValueOrReader<'a, &'a [u8], R>,
+        ) -> Result<Self::Out, AvroError> {
+            Ok((self.conv)(self.inner.fixed(r)?)?)
+        }
+    }
+    pub struct ArrayAsVecDecoder<
+        InnerOut,
+        Inner: AvroDecode<Out = InnerOut>,
+        Ctor: FnMut() -> Inner,
+    > {
+        ctor: Ctor,
+        buf: Vec<InnerOut>,
+    }
+
+    impl<InnerOut, Inner: AvroDecode<Out = InnerOut>, Ctor: FnMut() -> Inner>
+        ArrayAsVecDecoder<InnerOut, Inner, Ctor>
+    {
+        pub fn new(ctor: Ctor) -> Self {
+            Self { ctor, buf: vec![] }
+        }
+    }
+    impl<InnerOut, Inner: AvroDecode<Out = InnerOut>, Ctor: FnMut() -> Inner> AvroDecode
+        for ArrayAsVecDecoder<InnerOut, Inner, Ctor>
+    {
+        type Out = Vec<InnerOut>;
+        fn array<A: AvroArrayAccess>(mut self, a: &mut A) -> Result<Self::Out, AvroError> {
+            while let Some(next) = a.decode_next((self.ctor)())? {
+                self.buf.push(next);
+            }
+            Ok(self.buf)
+        }
+        define_unexpected! {
+            record, union_branch, map, enum_variant, scalar, decimal, bytes, string, json, uuid, fixed
+        }
+    }
+
+    pub struct DefaultArrayAsVecDecoder<T> {
+        buf: Vec<T>,
+    }
+    impl<T> Default for DefaultArrayAsVecDecoder<T> {
+        fn default() -> Self {
+            Self { buf: vec![] }
+        }
+    }
+    impl<T: AvroDecodeable> AvroDecode for DefaultArrayAsVecDecoder<T> {
+        type Out = Vec<T>;
+        fn array<A: AvroArrayAccess>(mut self, a: &mut A) -> Result<Self::Out, AvroError> {
+            while let Some(next) = {
+                let inner = T::new_decoder();
+                a.decode_next(inner)?
+            } {
+                self.buf.push(next);
+            }
+            Ok(self.buf)
+        }
+        define_unexpected! {
+            record, union_branch, map, enum_variant, scalar, decimal, bytes, string, json, uuid, fixed
+        }
+    }
+    impl<T: AvroDecodeable> StatefulAvroDecodeable for Vec<T> {
+        type Decoder = DefaultArrayAsVecDecoder<T>;
+        type State = ();
+
+        fn new_decoder(_state: Self::State) -> Self::Decoder {
+            DefaultArrayAsVecDecoder::<T>::default()
+        }
+    }
+
+    pub struct TrivialDecoder;
+
+    impl TrivialDecoder {
+        fn maybe_skip<'a, V, R: AvroRead>(
+            self,
+            r: ValueOrReader<'a, V, R>,
+        ) -> Result<(), AvroError> {
+            if let ValueOrReader::Reader { len, r } = r {
+                Ok(r.skip(len)?)
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    impl AvroDecode for TrivialDecoder {
+        type Out = ();
+        fn record<R: AvroRead, A: AvroRecordAccess<R>>(self, a: &mut A) -> Result<(), AvroError> {
+            while let Some((_, _, f)) = a.next_field()? {
+                f.decode_field(TrivialDecoder)?;
+            }
+            Ok(())
+        }
+        fn union_branch<'a, R: AvroRead, D: AvroDeserializer>(
+            self,
+            _idx: usize,
+            _n_variants: usize,
+            _null_variant: Option<usize>,
+            deserializer: D,
+            reader: &'a mut R,
+        ) -> Result<(), AvroError> {
+            deserializer.deserialize(reader, self)
+        }
+
+        fn enum_variant(self, _symbol: &str, _idx: usize) -> Result<(), AvroError> {
+            Ok(())
+        }
+        fn scalar(self, _scalar: Scalar) -> Result<(), AvroError> {
+            Ok(())
+        }
+        fn decimal<'a, R: AvroRead>(
+            self,
+            _precision: usize,
+            _scale: usize,
+            r: ValueOrReader<'a, &'a [u8], R>,
+        ) -> Result<(), AvroError> {
+            self.maybe_skip(r)
+        }
+        fn bytes<'a, R: AvroRead>(
+            self,
+            r: ValueOrReader<'a, &'a [u8], R>,
+        ) -> Result<(), AvroError> {
+            self.maybe_skip(r)
+        }
+        fn string<'a, R: AvroRead>(
+            self,
+            r: ValueOrReader<'a, &'a str, R>,
+        ) -> Result<(), AvroError> {
+            self.maybe_skip(r)
+        }
+        fn json<'a, R: AvroRead>(
+            self,
+            r: ValueOrReader<'a, &'a serde_json::Value, R>,
+        ) -> Result<(), AvroError> {
+            self.maybe_skip(r)
+        }
+        fn uuid<'a, R: AvroRead>(self, r: ValueOrReader<'a, &'a [u8], R>) -> Result<(), AvroError> {
+            self.maybe_skip(r)
+        }
+        fn fixed<'a, R: AvroRead>(
+            self,
+            r: ValueOrReader<'a, &'a [u8], R>,
+        ) -> Result<(), AvroError> {
+            self.maybe_skip(r)
+        }
+        fn array<A: AvroArrayAccess>(self, a: &mut A) -> Result<(), AvroError> {
+            while a.decode_next(TrivialDecoder)?.is_some() {}
+            Ok(())
+        }
+
+        fn map<M: AvroMapAccess>(self, m: &mut M) -> Result<(), AvroError> {
+            while let Some((_n, entry)) = m.next_entry()? {
+                entry.decode_field(TrivialDecoder)?
+            }
             Ok(())
         }
     }
-}
+    pub struct ValueDecoder;
+    impl AvroDecode for ValueDecoder {
+        type Out = Value;
+        fn record<R: AvroRead, A: AvroRecordAccess<R>>(
+            self,
+            a: &mut A,
+        ) -> Result<Value, AvroError> {
+            let mut fields = vec![];
+            while let Some((name, idx, f)) = a.next_field()? {
+                let next = ValueDecoder;
+                let val = f.decode_field(next)?;
+                fields.push((idx, (name.to_string(), val)));
+            }
+            fields.sort_by_key(|(idx, _)| *idx);
 
-impl AvroDecode for TrivialDecoder {
-    type Out = ();
-    fn record<R: AvroRead, A: AvroRecordAccess<R>>(self, a: &mut A) -> Result<(), Error> {
-        while let Some((_, _, f)) = a.next_field()? {
-            f.decode_field(TrivialDecoder)?;
+            Ok(Value::Record(
+                fields
+                    .into_iter()
+                    .map(|(_idx, (name, val))| (name, val))
+                    .collect(),
+            ))
         }
-        Ok(())
-    }
-    fn union_branch<'a, R: AvroRead, D: AvroDeserializer>(
-        self,
-        _idx: usize,
-        _n_variants: usize,
-        _null_variant: Option<usize>,
-        deserializer: &'a mut D,
-        reader: &'a mut R,
-    ) -> Result<(), Error> {
-        deserializer.deserialize(reader, self)
-    }
+        fn union_branch<'a, R: AvroRead, D: AvroDeserializer>(
+            self,
+            index: usize,
+            n_variants: usize,
+            null_variant: Option<usize>,
+            deserializer: D,
+            reader: &'a mut R,
+        ) -> Result<Value, AvroError> {
+            let next = ValueDecoder;
+            let inner = Box::new(deserializer.deserialize(reader, next)?);
+            Ok(Value::Union {
+                index,
+                inner,
+                n_variants,
+                null_variant,
+            })
+        }
+        fn array<A: AvroArrayAccess>(self, a: &mut A) -> Result<Value, AvroError> {
+            let mut items = vec![];
+            loop {
+                let next = ValueDecoder;
 
-    fn enum_variant(self, _symbol: &str, _idx: usize) -> Result<(), Error> {
-        Ok(())
-    }
-    fn scalar(self, _scalar: Scalar) -> Result<(), Error> {
-        Ok(())
-    }
-    fn decimal<'a, R: AvroRead>(
-        self,
-        _precision: usize,
-        _scale: usize,
-        r: ValueOrReader<'a, &'a [u8], R>,
-    ) -> Result<(), Error> {
-        self.maybe_skip(r)
-    }
-    fn bytes<'a, R: AvroRead>(self, r: ValueOrReader<'a, &'a [u8], R>) -> Result<(), Error> {
-        self.maybe_skip(r)
-    }
-    fn string<'a, R: AvroRead>(self, r: ValueOrReader<'a, &'a str, R>) -> Result<(), Error> {
-        self.maybe_skip(r)
-    }
-    fn json<'a, R: AvroRead>(
-        self,
-        r: ValueOrReader<'a, &'a serde_json::Value, R>,
-    ) -> Result<(), Error> {
-        self.maybe_skip(r)
-    }
-    fn fixed<'a, R: AvroRead>(self, r: ValueOrReader<'a, &'a [u8], R>) -> Result<(), Error> {
-        self.maybe_skip(r)
-    }
-    fn array<A: AvroArrayAccess>(self, a: &mut A) -> Result<(), Error> {
-        while a.decode_next(TrivialDecoder)?.is_some() {}
-        Ok(())
+                if let Some(value) = a.decode_next(next)? {
+                    items.push(value)
+                } else {
+                    break;
+                }
+            }
+            Ok(Value::Array(items))
+        }
+        fn enum_variant(self, symbol: &str, idx: usize) -> Result<Value, AvroError> {
+            Ok(Value::Enum(idx, symbol.to_string()))
+        }
+        fn scalar(self, scalar: Scalar) -> Result<Value, AvroError> {
+            Ok(scalar.into())
+        }
+        fn decimal<'a, R: AvroRead>(
+            self,
+            precision: usize,
+            scale: usize,
+            r: ValueOrReader<'a, &'a [u8], R>,
+        ) -> Result<Value, AvroError> {
+            let unscaled = match r {
+                ValueOrReader::Value(buf) => buf.to_vec(),
+                ValueOrReader::Reader { len, r } => {
+                    let mut buf = vec![];
+                    buf.resize_with(len, Default::default);
+                    r.read_exact(&mut buf)?;
+                    buf
+                }
+            };
+            Ok(Value::Decimal(DecimalValue {
+                unscaled,
+                precision,
+                scale,
+            }))
+        }
+        fn bytes<'a, R: AvroRead>(
+            self,
+            r: ValueOrReader<'a, &'a [u8], R>,
+        ) -> Result<Value, AvroError> {
+            let buf = match r {
+                ValueOrReader::Value(buf) => buf.to_vec(),
+                ValueOrReader::Reader { len, r } => {
+                    let mut buf = vec![];
+                    buf.resize_with(len, Default::default);
+                    r.read_exact(&mut buf)?;
+                    buf
+                }
+            };
+            Ok(Value::Bytes(buf))
+        }
+        fn string<'a, R: AvroRead>(
+            self,
+            r: ValueOrReader<'a, &'a str, R>,
+        ) -> Result<Value, AvroError> {
+            let s = match r {
+                ValueOrReader::Value(s) => s.to_string(),
+                ValueOrReader::Reader { len, r } => {
+                    let mut buf = vec![];
+                    buf.resize_with(len, Default::default);
+                    r.read_exact(&mut buf)?;
+                    String::from_utf8(buf)
+                        .map_err(|_e| AvroError::Decode(DecodeError::StringUtf8Error))?
+                }
+            };
+            Ok(Value::String(s))
+        }
+        fn json<'a, R: AvroRead>(
+            self,
+            r: ValueOrReader<'a, &'a serde_json::Value, R>,
+        ) -> Result<Value, AvroError> {
+            let val = match r {
+                ValueOrReader::Value(val) => val.clone(),
+                ValueOrReader::Reader { len, r } => {
+                    let mut buf = vec![];
+                    buf.resize_with(len, Default::default);
+                    r.read_exact(&mut buf)?;
+                    serde_json::from_slice(&buf)
+                        .map_err(|e| AvroError::Decode(DecodeError::BadJson(e.classify())))?
+                }
+            };
+            Ok(Value::Json(val))
+        }
+        fn uuid<'a, R: AvroRead>(
+            self,
+            r: ValueOrReader<'a, &'a [u8], R>,
+        ) -> Result<Value, AvroError> {
+            let buf = match r {
+                ValueOrReader::Value(val) => val.to_vec(),
+                ValueOrReader::Reader { len, r } => {
+                    let mut buf = vec![];
+                    buf.resize_with(len, Default::default);
+                    r.read_exact(&mut buf)?;
+                    buf
+                }
+            };
+            let s = std::str::from_utf8(&buf)
+                .map_err(|_| AvroError::Decode(DecodeError::UuidUtf8Error))?;
+            let val =
+                uuid::Uuid::parse_str(s).map_err(|e| AvroError::Decode(DecodeError::BadUuid(e)))?;
+            Ok(Value::Uuid(val))
+        }
+        fn fixed<'a, R: AvroRead>(
+            self,
+            r: ValueOrReader<'a, &'a [u8], R>,
+        ) -> Result<Value, AvroError> {
+            let buf = match r {
+                ValueOrReader::Value(buf) => buf.to_vec(),
+                ValueOrReader::Reader { len, r } => {
+                    let mut buf = vec![];
+                    buf.resize_with(len, Default::default);
+                    r.read_exact(&mut buf)?;
+                    buf
+                }
+            };
+            Ok(Value::Fixed(buf.len(), buf))
+        }
+        fn map<M: AvroMapAccess>(self, m: &mut M) -> Result<Value, AvroError> {
+            let mut entries = HashMap::new();
+            while let Some((name, a)) = m.next_entry()? {
+                let d = ValueDecoder;
+                let val = a.decode_field(d)?;
+                entries.insert(name, val);
+            }
+            Ok(Value::Map(entries))
+        }
     }
 }
 
 impl<'a> AvroDeserializer for &'a Value {
     fn deserialize<R: AvroRead, D: AvroDecode>(
-        &mut self,
+        self,
         _r: &mut R,
         d: D,
-    ) -> Result<D::Out, Error> {
-        give_value(d, *self)
+    ) -> Result<D::Out, AvroError> {
+        give_value(d, self)
     }
 }
 
-pub fn give_value<D: AvroDecode>(d: D, v: &Value) -> Result<D::Out, Error> {
+pub fn give_value<D: AvroDecode>(d: D, v: &Value) -> Result<D::Out, AvroError> {
     use ValueOrReader::Value as V;
     match v {
         Value::Null => d.scalar(Scalar::Null),
@@ -656,7 +1183,7 @@ pub fn give_value<D: AvroDecode>(d: D, v: &Value) -> Result<D::Out, Error> {
                 *index,
                 *n_variants,
                 *null_variant,
-                &mut inner.as_ref(),
+                &**inner,
                 &mut empty_reader,
             )
         }
@@ -674,24 +1201,21 @@ pub fn give_value<D: AvroDecode>(d: D, v: &Value) -> Result<D::Out, Error> {
             d.record(&mut a)
         }
         Value::Json(val) => d.json::<&[u8]>(V(val)),
+        Value::Uuid(val) => d.uuid::<&[u8]>(V(val.to_string().as_bytes())),
     }
 }
 
 pub trait AvroDeserializer {
-    fn deserialize<R: AvroRead, D: AvroDecode>(&mut self, r: &mut R, d: D)
-        -> Result<D::Out, Error>;
+    fn deserialize<R: AvroRead, D: AvroDecode>(self, r: &mut R, d: D) -> Result<D::Out, AvroError>;
 }
 
+#[derive(Clone, Copy)]
 pub struct GeneralDeserializer<'a> {
     pub schema: SchemaNode<'a>,
 }
 
 impl<'a> AvroDeserializer for GeneralDeserializer<'a> {
-    fn deserialize<R: AvroRead, D: AvroDecode>(
-        &mut self,
-        r: &mut R,
-        d: D,
-    ) -> Result<D::Out, Error> {
+    fn deserialize<R: AvroRead, D: AvroDecode>(self, r: &mut R, d: D) -> Result<D::Out, AvroError> {
         use ValueOrReader::Reader;
         match self.schema.inner {
             SchemaPiece::Null => d.scalar(Scalar::Null),
@@ -701,7 +1225,7 @@ impl<'a> AvroDeserializer for GeneralDeserializer<'a> {
                 let val = match buf[0] {
                     0u8 => false,
                     1u8 => true,
-                    _ => return Err(DecodeError::new("not a bool").into()),
+                    other => return Err(AvroError::Decode(DecodeError::BadBoolean(other))),
                 };
                 d.scalar(Scalar::Boolean(val))
             }
@@ -725,9 +1249,7 @@ impl<'a> AvroDeserializer for GeneralDeserializer<'a> {
                 let days = zag_i32(r)?;
                 let val = NaiveDate::from_ymd(1970, 1, 1)
                     .checked_add_signed(chrono::Duration::days(days.into()))
-                    .ok_or_else(|| {
-                        DecodeError::new(format!("Invalid num days from epoch: {0}", days))
-                    })?;
+                    .ok_or(AvroError::Decode(DecodeError::BadDate(days)))?;
                 d.scalar(Scalar::Date(val))
             }
             SchemaPiece::TimestampMilli => {
@@ -766,6 +1288,10 @@ impl<'a> AvroDeserializer for GeneralDeserializer<'a> {
                 let len = decode_len(r)?;
                 d.json(Reader { len, r })
             }
+            SchemaPiece::Uuid => {
+                let len = decode_len(r)?;
+                d.uuid(Reader { len, r })
+            }
             SchemaPiece::Array(inner) => {
                 // From the spec:
                 // Arrays are encoded as a series of blocks. Each block consists of a long count value, followed by that many array items. A block with count zero indicates the end of the array. Each item is encoded per the array's item schema.
@@ -788,14 +1314,15 @@ impl<'a> AvroDeserializer for GeneralDeserializer<'a> {
                         let null_variant = variants
                             .iter()
                             .position(|v| v == &SchemaPieceOrNamed::Piece(SchemaPiece::Null));
-                        self.schema = self.schema.step(variant);
-                        d.union_branch(index, n_variants, null_variant, self, r)
+                        let dsr = GeneralDeserializer {
+                            schema: self.schema.step(variant),
+                        };
+                        d.union_branch(index, n_variants, null_variant, dsr, r)
                     }
-                    None => Err(DecodeError::new(format!(
-                        "Union index out of bounds (new): {}",
-                        index
-                    ))
-                    .into()),
+                    None => Err(AvroError::Decode(DecodeError::BadUnionIndex {
+                        index,
+                        len: variants.len(),
+                    })),
                 }
             }
             SchemaPiece::ResolveIntLong => {
@@ -828,8 +1355,10 @@ impl<'a> AvroDeserializer for GeneralDeserializer<'a> {
                 n_reader_variants,
                 reader_null_variant,
             } => {
-                self.schema = self.schema.step(&**inner);
-                d.union_branch(*index, *n_reader_variants, *reader_null_variant, self, r)
+                let dsr = GeneralDeserializer {
+                    schema: self.schema.step(&**inner),
+                };
+                d.union_branch(*index, *n_reader_variants, *reader_null_variant, dsr, r)
             }
             SchemaPiece::ResolveUnionUnion {
                 permutation,
@@ -838,36 +1367,34 @@ impl<'a> AvroDeserializer for GeneralDeserializer<'a> {
             } => {
                 let index = decode_long_nonneg(r)? as usize;
                 if index >= permutation.len() {
-                    return Err(DecodeError::new(format!(
-                        "Union variant out of bounds for writer schema: {}; max {}",
+                    return Err(AvroError::Decode(DecodeError::BadUnionIndex {
                         index,
-                        permutation.len()
-                    ))
-                    .into());
+                        len: permutation.len(),
+                    }));
                 }
                 match &permutation[index] {
-                    Err(e) => Err(DecodeError::new(format!(
-                        "Union variant not found in reader schema: {}",
-                        e
-                    ))
-                    .into()),
+                    Err(e) => Err(e.clone()),
                     Ok((index, variant)) => {
-                        self.schema = self.schema.step(variant);
-                        d.union_branch(*index, *n_reader_variants, *reader_null_variant, self, r)
+                        let dsr = GeneralDeserializer {
+                            schema: self.schema.step(variant),
+                        };
+                        d.union_branch(*index, *n_reader_variants, *reader_null_variant, dsr, r)
                     }
                 }
             }
             SchemaPiece::ResolveUnionConcrete { index, inner } => {
                 let found_index = decode_long_nonneg(r)? as usize;
                 if *index != found_index {
-                    Err(DecodeError::new(
-                        "Union variant does not match reader schema's concrete type",
-                    )
-                    .into())
+                    Err(AvroError::Decode(DecodeError::WrongUnionIndex {
+                        expected: *index,
+                        actual: found_index,
+                    }))
                 } else {
-                    self.schema = self.schema.step(inner.as_ref());
+                    let dsr = GeneralDeserializer {
+                        schema: self.schema.step(inner.as_ref()),
+                    };
                     // The reader is not expecting a union here, so don't call `D::union_branch`
-                    self.deserialize(r, d)
+                    dsr.deserialize(r, d)
                 }
             }
             SchemaPiece::Record {
@@ -885,12 +1412,10 @@ impl<'a> AvroDeserializer for GeneralDeserializer<'a> {
             } => {
                 let index = decode_int_nonneg(r)? as usize;
                 match symbols.get(index) {
-                    None => Err(DecodeError::new(format!(
-                        "enum symbol index out of bounds: {}, [0, {})",
+                    None => Err(AvroError::Decode(DecodeError::BadEnumIndex {
                         index,
-                        symbols.len()
-                    ))
-                    .into()),
+                        len: symbols.len(),
+                    })),
                     Some(symbol) => d.enum_variant(symbol, index),
                 }
             }
@@ -915,22 +1440,19 @@ impl<'a> AvroDeserializer for GeneralDeserializer<'a> {
             } => {
                 let index = decode_int_nonneg(r)? as usize;
                 match symbols.get(index) {
-                    None => Err(DecodeError::new(format!(
-                        "enum symbol index out of bounds: {}, [0, {})",
+                    None => Err(AvroError::Decode(DecodeError::BadEnumIndex {
                         index,
-                        symbols.len()
-                    ))
-                    .into()),
+                        len: symbols.len(),
+                    })),
                     Some(op) => match op {
                         Err(missing) => {
                             if let Some((reader_index, symbol)) = default.clone() {
                                 d.enum_variant(&symbol, reader_index)
                             } else {
-                                Err(DecodeError::new(format!(
-                                    "Enum symbol {} at index {} in writer schema not found in reader",
-                                    missing, index
-                                ))
-                                    .into())
+                                Err(AvroError::Decode(DecodeError::MissingEnumIndex {
+                                    index,
+                                    symbol: missing.clone(),
+                                }))
                             }
                         }
                         Ok((index, name)) => d.enum_variant(name, *index),
@@ -958,156 +1480,20 @@ impl<'a> AvroDeserializer for GeneralDeserializer<'a> {
 
                 let date = NaiveDate::from_ymd(1970, 1, 1)
                     .checked_add_signed(chrono::Duration::days(days.into()))
-                    .ok_or_else(|| {
-                        DecodeError::new(format!("Invalid num days from epoch: {0}", days))
-                    })?;
+                    .ok_or(AvroError::Decode(DecodeError::BadDate(days)))?;
                 let dt = date.and_hms(0, 0, 0);
                 d.scalar(Scalar::Timestamp(dt))
             }
         }
     }
 }
-pub struct ValueDecoder;
-impl AvroDecode for ValueDecoder {
-    type Out = Value;
-    fn record<R: AvroRead, A: AvroRecordAccess<R>>(self, a: &mut A) -> Result<Value, Error> {
-        let mut fields = vec![];
-        while let Some((name, idx, f)) = a.next_field()? {
-            let next = ValueDecoder;
-            let val = f.decode_field(next)?;
-            fields.push((idx, (name.to_string(), val)));
-        }
-        fields.sort_by_key(|(idx, _)| *idx);
-
-        Ok(Value::Record(
-            fields
-                .into_iter()
-                .map(|(_idx, (name, val))| (name, val))
-                .collect(),
-        ))
-    }
-    fn union_branch<'a, R: AvroRead, D: AvroDeserializer>(
-        self,
-        index: usize,
-        n_variants: usize,
-        null_variant: Option<usize>,
-        deserializer: &'a mut D,
-        reader: &'a mut R,
-    ) -> Result<Value, Error> {
-        let next = ValueDecoder;
-        let inner = Box::new(deserializer.deserialize(reader, next)?);
-        Ok(Value::Union {
-            index,
-            inner,
-            n_variants,
-            null_variant,
-        })
-    }
-    fn array<A: AvroArrayAccess>(self, a: &mut A) -> Result<Value, Error> {
-        let mut items = vec![];
-        loop {
-            let next = ValueDecoder;
-
-            if let Some(value) = a.decode_next(next)? {
-                items.push(value)
-            } else {
-                break;
-            }
-        }
-        Ok(Value::Array(items))
-    }
-    fn enum_variant(self, symbol: &str, idx: usize) -> Result<Value, Error> {
-        Ok(Value::Enum(idx, symbol.to_string()))
-    }
-    fn scalar(self, scalar: Scalar) -> Result<Value, Error> {
-        Ok(scalar.into())
-    }
-    fn decimal<'a, R: AvroRead>(
-        self,
-        precision: usize,
-        scale: usize,
-        r: ValueOrReader<'a, &'a [u8], R>,
-    ) -> Result<Value, Error> {
-        let unscaled = match r {
-            ValueOrReader::Value(buf) => buf.to_vec(),
-            ValueOrReader::Reader { len, r } => {
-                let mut buf = vec![];
-                buf.resize_with(len, Default::default);
-                r.read_exact(&mut buf)?;
-                buf
-            }
-        };
-        Ok(Value::Decimal(DecimalValue {
-            unscaled,
-            precision,
-            scale,
-        }))
-    }
-    fn bytes<'a, R: AvroRead>(self, r: ValueOrReader<'a, &'a [u8], R>) -> Result<Value, Error> {
-        let buf = match r {
-            ValueOrReader::Value(buf) => buf.to_vec(),
-            ValueOrReader::Reader { len, r } => {
-                let mut buf = vec![];
-                buf.resize_with(len, Default::default);
-                r.read_exact(&mut buf)?;
-                buf
-            }
-        };
-        Ok(Value::Bytes(buf))
-    }
-    fn string<'a, R: AvroRead>(self, r: ValueOrReader<'a, &'a str, R>) -> Result<Value, Error> {
-        let s = match r {
-            ValueOrReader::Value(s) => s.to_string(),
-            ValueOrReader::Reader { len, r } => {
-                let mut buf = vec![];
-                buf.resize_with(len, Default::default);
-                r.read_exact(&mut buf)?;
-                String::from_utf8(buf)?
-            }
-        };
-        Ok(Value::String(s))
-    }
-    fn json<'a, R: AvroRead>(
-        self,
-        r: ValueOrReader<'a, &'a serde_json::Value, R>,
-    ) -> Result<Value, Error> {
-        let val = match r {
-            ValueOrReader::Value(val) => val.clone(),
-            ValueOrReader::Reader { len, r } => {
-                let mut buf = vec![];
-                buf.resize_with(len, Default::default);
-                r.read_exact(&mut buf)?;
-                serde_json::from_slice(&buf)?
-            }
-        };
-        Ok(Value::Json(val))
-    }
-    fn fixed<'a, R: AvroRead>(self, r: ValueOrReader<'a, &'a [u8], R>) -> Result<Value, Error> {
-        let buf = match r {
-            ValueOrReader::Value(buf) => buf.to_vec(),
-            ValueOrReader::Reader { len, r } => {
-                let mut buf = vec![];
-                buf.resize_with(len, Default::default);
-                r.read_exact(&mut buf)?;
-                buf
-            }
-        };
-        Ok(Value::Fixed(buf.len(), buf))
-    }
-    fn map<M: AvroMapAccess>(self, m: &mut M) -> Result<Value, Error> {
-        let mut entries = HashMap::new();
-        while let Some((name, a)) = m.next_entry()? {
-            let d = ValueDecoder;
-            let val = a.decode_field(d)?;
-            entries.insert(name, val);
-        }
-        Ok(Value::Map(entries))
-    }
-}
 /// Decode a `Value` from avro format given its `Schema`.
-pub fn decode<'a, R: AvroRead>(schema: SchemaNode<'a>, reader: &'a mut R) -> Result<Value, Error> {
+pub fn decode<'a, R: AvroRead>(
+    schema: SchemaNode<'a>,
+    reader: &'a mut R,
+) -> Result<Value, AvroError> {
     let d = ValueDecoder;
-    let mut dsr = GeneralDeserializer { schema };
+    let dsr = GeneralDeserializer { schema };
     let val = dsr.deserialize(reader, d)?;
     Ok(val)
 }

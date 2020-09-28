@@ -310,24 +310,27 @@
 
 mod codec;
 mod decode;
-mod encode;
+pub mod encode;
 mod reader;
 mod util;
 mod writer;
 
+pub mod error;
 pub mod schema;
 pub mod types;
 
 pub use crate::codec::Codec;
+pub use crate::decode::public_decoders::*;
 pub use crate::decode::{
-    give_value, AvroArrayAccess, AvroDecode, AvroDeserializer, AvroFieldAccess, AvroRead,
-    AvroRecordAccess, GeneralDeserializer, Skip, TrivialDecoder, ValueDecoder, ValueOrReader,
+    give_value, AvroArrayAccess, AvroDecode, AvroDecodeable, AvroDeserializer, AvroFieldAccess,
+    AvroMapAccess, AvroRead, AvroRecordAccess, GeneralDeserializer, Skip, StatefulAvroDecodeable,
+    ValueOrReader,
 };
 pub use crate::encode::encode as encode_unchecked;
 pub use crate::reader::{from_avro_datum, Reader};
 pub use crate::schema::{ParseSchemaError, Schema};
 pub use crate::types::SchemaResolutionError;
-pub use crate::util::{max_allocation_bytes, DecodeError};
+pub use crate::util::max_allocation_bytes;
 pub use crate::writer::{to_avro_datum, write_avro_datum, ValidationError, Writer};
 
 #[cfg(test)]

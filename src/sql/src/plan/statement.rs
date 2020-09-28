@@ -8,7 +8,7 @@
 // by the Apache License, Version 2.0.
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -31,31 +31,30 @@ use dataflow_types::{
 use expr::{GlobalId, RowSetFinishing};
 use interchange::avro::{self, DebeziumDeduplicationStrategy, Encoder};
 use ore::collections::CollectionExt;
-use repr::{strconv, ColumnName};
-use repr::{ColumnType, Datum, RelationDesc, RelationType, Row, RowArena, ScalarType};
+use repr::{strconv, Datum, RelationDesc, RelationType, Row, ScalarType};
 use sql_parser::ast::{
-    AlterObjectRenameStatement, AvroSchema, BinaryOperator, ColumnOption, Connector,
-    CreateDatabaseStatement, CreateIndexStatement, CreateSchemaStatement, CreateSinkStatement,
-    CreateSourceStatement, CreateTableStatement, CreateViewStatement, DropDatabaseStatement,
-    DropObjectsStatement, ExplainStage, ExplainStatement, Explainee, Expr, Format, Ident,
-    IfExistsBehavior, InsertStatement, Join, JoinConstraint, JoinOperator, ObjectName, ObjectType,
-    Query, Select, SelectItem, SelectStatement, SetExpr, SetVariableStatement, SetVariableValue,
-    ShowColumnsStatement, ShowCreateIndexStatement, ShowCreateSinkStatement,
-    ShowCreateSourceStatement, ShowCreateTableStatement, ShowCreateViewStatement,
-    ShowDatabasesStatement, ShowIndexesStatement, ShowObjectsStatement, ShowStatementFilter,
-    ShowVariableStatement, SqlOption, Statement, TableFactor, TableWithJoins, TailStatement, Value,
+    AlterIndexOptionsList, AlterIndexOptionsStatement, AlterObjectRenameStatement, AvroSchema,
+    ColumnOption, Connector, CreateDatabaseStatement, CreateIndexStatement, CreateSchemaStatement,
+    CreateSinkStatement, CreateSourceStatement, CreateTableStatement, CreateViewStatement,
+    DropDatabaseStatement, DropObjectsStatement, ExplainStage, ExplainStatement, Explainee, Expr,
+    Format, Ident, IfExistsBehavior, InsertStatement, ObjectName, ObjectType, Query,
+    SelectStatement, SetVariableStatement, SetVariableValue, ShowColumnsStatement,
+    ShowCreateIndexStatement, ShowCreateSinkStatement, ShowCreateSourceStatement,
+    ShowCreateTableStatement, ShowCreateViewStatement, ShowDatabasesStatement,
+    ShowIndexesStatement, ShowObjectsStatement, ShowStatementFilter, ShowVariableStatement,
+    SqlOption, Statement, TailStatement, Value,
 };
 
-use crate::ast::InsertSource;
 use crate::catalog::{Catalog, CatalogItemType};
 use crate::kafka_util;
-use crate::names::{DatabaseSpecifier, FullName, PartialName};
+use crate::names::{DatabaseSpecifier, FullName, PartialName, SchemaSpecifier};
 use crate::normalize;
+use crate::parse::parse;
 use crate::plan::error::PlanError;
 use crate::plan::query::QueryLifetime;
 use crate::plan::{
-    query, scalar_type_from_sql, Index, Params, PeekWhen, Plan, PlanContext, Sink, Source, Table,
-    View,
+    query, scalar_type_from_sql, AlterIndexLogicalCompactionWindow, Index, LogicalCompactionWindow,
+    Params, PeekWhen, Plan, PlanContext, Sink, Source, Table, View,
 };
 use crate::pure::Schema;
 
@@ -63,7 +62,7 @@ lazy_static! {
     static ref SHOW_DATABASES_DESC: RelationDesc =
         RelationDesc::empty().with_column("database", ScalarType::String.nullable(false));
     static ref SHOW_INDEXES_DESC: RelationDesc = RelationDesc::empty()
-        .with_column("Source_or_view", ScalarType::String.nullable(false))
+        .with_column("On_name", ScalarType::String.nullable(false))
         .with_column("Key_name", ScalarType::String.nullable(false))
         .with_column("Column_name", ScalarType::String.nullable(true))
         .with_column("Expression", ScalarType::String.nullable(true))
@@ -85,10 +84,6 @@ pub fn make_show_objects_desc(
         let mut relation_desc = RelationDesc::empty()
             .with_column(col_name, ScalarType::String.nullable(false))
             .with_column("TYPE", ScalarType::String.nullable(false));
-        if ObjectType::View == object_type {
-            relation_desc =
-                relation_desc.with_column("QUERYABLE", ScalarType::Bool.nullable(false));
-        }
         if !materialized && (ObjectType::View == object_type || ObjectType::Source == object_type) {
             relation_desc =
                 relation_desc.with_column("MATERIALIZED", ScalarType::Bool.nullable(false));
@@ -130,7 +125,7 @@ pub fn describe_statement(
         | Statement::Rollback(_)
         | Statement::Commit(_)
         | Statement::AlterObjectRename(_)
-        | Statement::Insert(_) => (None, vec![]),
+        | Statement::AlterIndexOptions(_) => (None, vec![]),
 
         Statement::Explain(ExplainStatement {
             stage, explainee, ..
@@ -148,7 +143,7 @@ pub fn describe_statement(
                     describe_statement(
                         catalog,
                         Statement::Select(SelectStatement {
-                            query: Box::new(q),
+                            query: q,
                             as_of: None,
                         }),
                         param_types_in,
@@ -248,21 +243,21 @@ pub fn describe_statement(
             (Some(sql_object.desc()?.clone()), vec![])
         }
 
+        // TODO(benesch): currently, describing a `SELECT` or `INSERT` query
+        // plans the whole query to determine its shape and parameter types,
+        // and then throws away that plan. If we were smarter, we'd stash that
+        // plan somewhere so we don't have to recompute it when the query is
+        // executed.
         Statement::Select(SelectStatement { query, .. }) => {
-            // TODO(benesch): ideally we'd save `relation_expr` and `finishing`
-            // somewhere, so we don't have to reanalyze the whole query when
-            // `handle_statement` is called. This will require a complicated
-            // dance when bind parameters are implemented, so punting for now.
             let (_relation_expr, desc, _finishing) =
-                query::plan_root_query(&scx, *query, QueryLifetime::OneShot)?;
-            let mut param_types = vec![];
-            for (i, (n, typ)) in scx.unwrap_param_types().into_iter().enumerate() {
-                if n != i + 1 {
-                    bail!("unable to infer type for parameter ${}", i + 1);
-                }
-                param_types.push(typ);
-            }
-            (Some(desc), param_types)
+                query::plan_root_query(&scx, query, QueryLifetime::OneShot)?;
+            (Some(desc), scx.finalize_param_types()?)
+        }
+        Statement::Insert(InsertStatement {
+            table_name, source, ..
+        }) => {
+            query::plan_insert_query(&scx, table_name, source)?;
+            (None, scx.finalize_param_types()?)
         }
 
         Statement::Update(_) => bail!("UPDATE statements are not supported"),
@@ -300,6 +295,7 @@ pub fn handle_statement(
         Statement::DropDatabase(stmt) => handle_drop_database(scx, stmt),
         Statement::DropObjects(stmt) => handle_drop_objects(scx, stmt),
         Statement::AlterObjectRename(stmt) => handle_alter_object_rename(scx, stmt),
+        Statement::AlterIndexOptions(stmt) => handle_alter_index_options(scx, stmt),
         Statement::ShowColumns(stmt) => handle_show_columns(scx, stmt),
         Statement::ShowCreateIndex(stmt) => handle_show_create_index(scx, stmt),
         Statement::ShowCreateSink(stmt) => handle_show_create_sink(scx, stmt),
@@ -316,7 +312,7 @@ pub fn handle_statement(
         Statement::Select(stmt) => handle_select(scx, stmt, params),
         Statement::Tail(stmt) => handle_tail(scx, stmt),
 
-        Statement::Insert(stmt) => handle_insert(scx, stmt),
+        Statement::Insert(stmt) => handle_insert(scx, stmt, params),
 
         Statement::StartTransaction(_) => Ok(Plan::StartTransaction),
         Statement::Rollback(_) => Ok(Plan::AbortTransaction),
@@ -427,20 +423,73 @@ fn handle_alter_object_rename(
     })
 }
 
-fn finish_show_where(
+fn handle_alter_index_options(
     scx: &StatementContext,
-    filter: Option<ShowStatementFilter>,
-    rows: Vec<Vec<Datum>>,
-    desc: &RelationDesc,
+    AlterIndexOptionsStatement {
+        index_name,
+        if_exists,
+        options,
+    }: AlterIndexOptionsStatement,
 ) -> Result<Plan, anyhow::Error> {
-    let (r, finishing) = query::plan_show_where(scx, filter, rows, desc)?;
+    let alter_index = match scx.resolve_item(index_name) {
+        Ok(name) => {
+            let entry = scx.catalog.get_item(&name);
+            if entry.item_type() != CatalogItemType::Index {
+                bail!("{} is a {} not a index", name, entry.item_type())
+            }
 
-    Ok(Plan::Peek {
-        source: r.decorrelate(),
-        when: PeekWhen::Immediately,
-        finishing,
-        materialize: true,
-    })
+            let logical_compaction_window = match options {
+                AlterIndexOptionsList::Reset(o) => {
+                    let mut options: HashSet<_> =
+                        o.iter().map(|x| normalize::ident(x.clone())).collect();
+                    // Follow Postgres and don't complain if unknown parameters
+                    // are passed into ALTER INDEX ... RESET
+                    if options.remove("logical_compaction_window") {
+                        Some(LogicalCompactionWindow::Default)
+                    } else {
+                        None
+                    }
+                }
+                AlterIndexOptionsList::Set(o) => {
+                    let mut options = normalize::options(&o);
+
+                    let logical_compaction_window = match options
+                        .remove("logical_compaction_window")
+                    {
+                        Some(Value::String(window)) => match window.as_str() {
+                            "off" => Some(LogicalCompactionWindow::Off),
+                            s => Some(LogicalCompactionWindow::Custom(parse_duration::parse(s)?)),
+                        },
+                        Some(_) => bail!("\"logical_compaction_window\" must be a string"),
+                        None => None,
+                    };
+
+                    if !options.is_empty() {
+                        bail!("unrecognized parameter: \"{}\". Only \"logical_compaction_window\" is currently supported.",
+                              options.keys().next().expect("known to exist"))
+                    }
+
+                    logical_compaction_window
+                }
+            };
+
+            if let Some(logical_compaction_window) = logical_compaction_window {
+                Some(AlterIndexLogicalCompactionWindow {
+                    index: entry.id(),
+                    logical_compaction_window,
+                })
+            } else {
+                None
+            }
+        }
+        Err(_) if if_exists => {
+            // TODO(rkhaitan): better message indicating that the index does not exist.
+            None
+        }
+        Err(e) => return Err(e.into()),
+    };
+
+    Ok(Plan::AlterIndexLogicalCompactionWindow(alter_index))
 }
 
 fn handle_show_databases(
@@ -448,37 +497,20 @@ fn handle_show_databases(
     ShowDatabasesStatement { filter }: ShowDatabasesStatement,
 ) -> Result<Plan, anyhow::Error> {
     let filter = match filter {
-        Some(ShowStatementFilter::Like(s)) => Some(Expr::BinaryOp {
-            left: Box::new(Expr::Identifier(vec![Ident::new("database")])),
-            op: BinaryOperator::Like,
-            right: Box::new(Expr::Value(Value::String(s))),
-        }),
-        Some(ShowStatementFilter::Where(selection)) => Some(selection),
-        None => None,
+        Some(ShowStatementFilter::Like(like)) => {
+            format!("AND database LIKE {}", Value::String(like))
+        }
+        Some(ShowStatementFilter::Where(expr)) => format!("AND {}", expr.to_string()),
+        None => "".to_owned(),
     };
-    let select = Select::default()
-        .from(TableWithJoins {
-            relation: TableFactor::Table {
-                name: ObjectName(vec![Ident::new("mz_databases")]),
-                alias: None,
-            },
-            joins: vec![],
-        })
-        .project(SelectItem::Expr {
-            expr: Expr::Identifier(vec![Ident::new("database")]),
-            alias: None,
-        })
-        .selection(filter);
-    handle_select(
+    handle_generated_select(
         scx,
-        SelectStatement {
-            query: Box::new(Query::select(select)),
-            as_of: None,
-        },
-        &Params {
-            datums: Row::pack(&[]),
-            types: vec![],
-        },
+        format!(
+            "SELECT database
+             FROM mz_catalog.mz_databases
+             WHERE mz_catalog.mz_databases.id != -1 {}",
+            filter
+        ),
     )
 }
 
@@ -493,148 +525,292 @@ fn handle_show_objects(
         filter,
     }: ShowObjectsStatement,
 ) -> Result<Plan, anyhow::Error> {
-    let classify_id = |id| match id {
-        GlobalId::System(_) => "SYSTEM",
-        GlobalId::User(_) => "USER",
+    match object_type {
+        ObjectType::Schema => handle_show_schemas(scx, extended, full, from, filter),
+        ObjectType::Table => handle_show_tables(scx, extended, full, from, filter),
+        ObjectType::Source => handle_show_sources(scx, full, materialized, from, filter),
+        ObjectType::View => handle_show_views(scx, full, materialized, from, filter),
+        ObjectType::Sink => handle_show_sinks(scx, full, from, filter),
+        ObjectType::Index => unreachable!("SHOW INDEX handled separately"),
+    }
+}
+
+fn handle_show_schemas(
+    scx: &StatementContext,
+    extended: bool,
+    full: bool,
+    from: Option<ObjectName>,
+    filter: Option<ShowStatementFilter>,
+) -> Result<Plan, anyhow::Error> {
+    let database_name = if let Some(from) = from {
+        scx.resolve_database(from)?
+    } else {
+        scx.resolve_default_database()?.to_string()
     };
-    let arena = RowArena::new();
-    let make_row = |name: &str, class: &str| {
-        if full {
-            vec![
-                Datum::from(arena.push_string(name.to_string())),
-                Datum::from(arena.push_string(class.to_string())),
-            ]
-        } else {
-            vec![Datum::from(arena.push_string(name.to_string()))]
-        }
+    let filter = match filter {
+        Some(ShowStatementFilter::Like(like)) => format!("AND schema LIKE {}", Value::String(like)),
+        Some(ShowStatementFilter::Where(expr)) => format!("AND {}", expr.to_string()),
+        None => "".to_owned(),
     };
 
-    if let ObjectType::Schema = object_type {
-        let mut selection = {
-            let database_name = if let Some(from) = from {
-                scx.resolve_database(from)?
-            } else {
-                scx.resolve_default_database()?.to_string()
-            };
-            let mut selection = Expr::BinaryOp {
-                left: Box::new(Expr::Identifier(vec![Ident::new("database")])),
-                op: BinaryOperator::Eq,
-                right: Box::new(Expr::Value(Value::String(database_name))),
-            };
-            if extended {
-                selection = Expr::BinaryOp {
-                    left: Box::new(selection),
-                    op: BinaryOperator::Or,
-                    right: Box::new(Expr::BinaryOp {
-                        left: Box::new(Expr::Identifier(vec![Ident::new("database_id")])),
-                        op: BinaryOperator::Eq,
-                        right: Box::new(Expr::Value(Value::String("AMBIENT".to_owned()))),
-                    }),
-                }
-            }
-            selection
-        };
-        if let Some(filter) = filter {
-            let filter = match filter {
-                ShowStatementFilter::Like(l) => Expr::BinaryOp {
-                    left: Box::new(Expr::Identifier(vec![Ident::new("schema")])),
-                    op: BinaryOperator::Like,
-                    right: Box::new(Expr::Value(Value::String(l))),
-                },
-                ShowStatementFilter::Where(w) => w,
-            };
-            selection = Expr::BinaryOp {
-                left: Box::new(selection),
-                op: BinaryOperator::And,
-                right: Box::new(filter),
-            }
-        }
-
-        let mut select = Select::default()
-            .from(TableWithJoins {
-                relation: TableFactor::Table {
-                    name: ObjectName(vec![Ident::new("mz_schemas")]),
-                    alias: None,
-                },
-                joins: vec![Join {
-                    relation: TableFactor::Table {
-                        name: ObjectName(vec![Ident::new("mz_databases")]),
-                        alias: None,
-                    },
-                    join_operator: JoinOperator::LeftOuter(JoinConstraint::On(Expr::BinaryOp {
-                        left: Box::new(Expr::Identifier(vec![Ident::new("database_id")])),
-                        op: BinaryOperator::Eq,
-                        right: Box::new(Expr::Identifier(vec![Ident::new("global_id")])),
-                    })),
-                }],
-            })
-            .selection(Some(selection))
-            .project(SelectItem::Expr {
-                expr: Expr::Identifier(vec![Ident::new("schema".to_owned())]),
-                alias: None,
-            });
-
-        if full {
-            select.projection.push(SelectItem::Expr {
-                expr: Expr::Identifier(vec![Ident::new("type".to_owned())]),
-                alias: None,
-            })
-        }
-
-        handle_select(
-            scx,
-            SelectStatement {
-                query: Box::new(Query::select(select)),
-                as_of: None,
-            },
-            &Params {
-                datums: Row::pack(&[]),
-                types: vec![],
-            },
+    let query = if !full & !extended {
+        format!(
+            "SELECT schema
+            FROM mz_catalog.mz_schemas
+            JOIN mz_catalog.mz_databases ON mz_catalog.mz_schemas.database_id = mz_catalog.mz_databases.id
+            WHERE mz_catalog.mz_databases.database = '{}' {}",
+            database_name, filter
+        )
+    } else if full & !extended {
+        format!(
+            "SELECT schema, type
+            FROM mz_catalog.mz_schemas
+            JOIN mz_catalog.mz_databases ON mz_catalog.mz_schemas.database_id = mz_catalog.mz_databases.id
+            WHERE mz_catalog.mz_databases.database = '{}' {}",
+            database_name, filter
+        )
+    } else if !full & extended {
+        // -1 is the ambient database id.
+        format!(
+            "SELECT schema
+            FROM mz_catalog.mz_schemas
+            JOIN mz_catalog.mz_databases ON mz_catalog.mz_schemas.database_id = mz_catalog.mz_databases.id
+            WHERE mz_catalog.mz_databases.database = '{}' OR mz_catalog.mz_databases.id = -1 {}",
+            database_name, filter
         )
     } else {
-        let items = if let Some(from) = from {
-            let (database_spec, schema_name) = scx.resolve_schema(from)?;
-            scx.catalog.list_items(&database_spec, &schema_name)
-        } else {
-            scx.catalog
-                .list_items(&scx.resolve_default_database()?, "public")
-        };
-
-        let rows = items
-            .filter(|entry| object_type == entry.item_type())
-            .filter_map(|entry| {
-                let name = &entry.name().item;
-                let class = classify_id(entry.id());
-                match object_type {
-                    ObjectType::View | ObjectType::Source => {
-                        let mut row = vec![Datum::from(arena.push_string(name.to_string()))];
-                        if full {
-                            row.push(Datum::from(arena.push_string(class.to_string())));
-                        }
-                        if full && object_type == ObjectType::View {
-                            row.push(Datum::from(scx.catalog.is_queryable(entry.id())));
-                        }
-                        if full && !materialized {
-                            row.push(Datum::from(scx.catalog.is_materialized(entry.id())));
-                        }
-                        if !materialized || scx.catalog.is_materialized(entry.id()) {
-                            Some(row)
-                        } else {
-                            None
-                        }
-                    }
-                    _ => Some(make_row(name, class)),
-                }
-            });
-
-        finish_show_where(
-            scx,
-            filter,
-            rows.collect(),
-            &make_show_objects_desc(object_type, materialized, full),
+        // -1 is the ambient database id.
+        format!(
+            "SELECT schema, type
+            FROM mz_catalog.mz_schemas
+            JOIN mz_catalog.mz_databases ON mz_catalog.mz_schemas.database_id = mz_catalog.mz_databases.id
+            WHERE mz_catalog.mz_databases.database = '{}' OR mz_catalog.mz_databases.id = -1 {}",
+            database_name, filter
         )
+    };
+    handle_generated_select(scx, query)
+}
+
+fn handle_show_sinks(
+    scx: &StatementContext,
+    full: bool,
+    from: Option<ObjectName>,
+    filter: Option<ShowStatementFilter>,
+) -> Result<Plan, anyhow::Error> {
+    let schema_spec = if let Some(from) = from {
+        scx.resolve_schema(from)?.1
+    } else {
+        scx.resolve_default_schema()?
+    };
+    let filter = match filter {
+        Some(ShowStatementFilter::Like(like)) => format!("AND sinks LIKE {}", Value::String(like)),
+        Some(ShowStatementFilter::Where(expr)) => format!("AND {}", expr.to_string()),
+        None => "".to_owned(),
+    };
+
+    let query = if full {
+        format!(
+            "SELECT sinks, type
+            FROM mz_catalog.mz_sinks
+            JOIN mz_catalog.mz_schemas ON mz_catalog.mz_sinks.schema_id = mz_catalog.mz_schemas.schema_id
+            WHERE schema_id = {} {}
+            ORDER BY sinks, type",
+            schema_spec.id, filter
+        )
+    } else {
+        format!(
+            "SELECT sinks FROM mz_catalog.mz_sinks WHERE schema_id = {} {} ORDER BY sinks",
+            schema_spec.id, filter
+        )
+    };
+    handle_generated_select(scx, query)
+}
+
+fn handle_show_views(
+    scx: &StatementContext,
+    full: bool,
+    materialized: bool,
+    from: Option<ObjectName>,
+    filter: Option<ShowStatementFilter>,
+) -> Result<Plan, anyhow::Error> {
+    let schema_spec = if let Some(from) = from {
+        scx.resolve_schema(from)?.1
+    } else {
+        scx.resolve_default_schema()?
+    };
+    let filter = match filter {
+        Some(ShowStatementFilter::Like(like)) => format!("AND views LIKE {}", Value::String(like)),
+        Some(ShowStatementFilter::Where(expr)) => format!("AND {}", expr.to_string()),
+        None => "".to_owned(),
+    };
+
+    let query = if !full & !materialized {
+        format!(
+            "SELECT views
+             FROM mz_catalog.mz_views
+             WHERE mz_catalog.mz_views.schema_id = {} {}
+             ORDER BY views ASC",
+            schema_spec.id, filter
+        )
+    } else if full & !materialized {
+        format!(
+            "SELECT
+                views,
+                type,
+                count > 0 as materialized
+             FROM mz_catalog.mz_views as mz_views
+             JOIN mz_catalog.mz_schemas ON mz_catalog.mz_views.schema_id = mz_catalog.mz_schemas.schema_id
+             JOIN (SELECT mz_views.global_id as global_id, count(mz_indexes.on_global_id) AS count
+                   FROM mz_views
+                   LEFT JOIN mz_indexes on mz_views.global_id = mz_indexes.on_global_id
+                   GROUP BY mz_views.global_id) as mz_indexes_count
+                ON mz_views.global_id = mz_indexes_count.global_id
+             WHERE mz_catalog.mz_views.schema_id = {} {}
+             ORDER BY views ASC",
+            schema_spec.id, filter
+        )
+    } else if !full & materialized {
+        format!(
+            "SELECT views
+             FROM mz_catalog.mz_views
+             JOIN (SELECT mz_views.global_id as global_id, count(mz_indexes.on_global_id) AS count
+                   FROM mz_views
+                   LEFT JOIN mz_indexes on mz_views.global_id = mz_indexes.on_global_id
+                   GROUP BY mz_views.global_id) as mz_indexes_count
+                ON mz_views.global_id = mz_indexes_count.global_id
+             WHERE mz_catalog.mz_views.schema_id = {}
+                AND mz_indexes_count.count > 0 {}
+             ORDER BY views ASC",
+            schema_spec.id, filter
+        )
+    } else {
+        format!(
+            "SELECT views, type
+             FROM mz_catalog.mz_views
+             JOIN mz_catalog.mz_schemas ON mz_catalog.mz_views.schema_id = mz_catalog.mz_schemas.schema_id
+             JOIN (SELECT mz_views.global_id as global_id, count(mz_indexes.on_global_id) AS count
+                   FROM mz_views
+                   LEFT JOIN mz_indexes on mz_views.global_id = mz_indexes.on_global_id
+                   GROUP BY mz_views.global_id) as mz_indexes_count
+                ON mz_views.global_id = mz_indexes_count.global_id
+             WHERE mz_catalog.mz_views.schema_id = {}
+                AND mz_indexes_count.count > 0 {}
+             ORDER BY views ASC",
+            schema_spec.id, filter
+        )
+    };
+    handle_generated_select(scx, query)
+}
+
+fn handle_show_sources(
+    scx: &StatementContext,
+    full: bool,
+    materialized: bool,
+    from: Option<ObjectName>,
+    filter: Option<ShowStatementFilter>,
+) -> Result<Plan, anyhow::Error> {
+    let schema_spec = if let Some(from) = from {
+        scx.resolve_schema(from)?.1
+    } else {
+        scx.resolve_default_schema()?
+    };
+    let filter = match filter {
+        Some(ShowStatementFilter::Like(like)) => {
+            format!("AND sources LIKE {}", Value::String(like))
+        }
+        Some(ShowStatementFilter::Where(expr)) => format!("AND {}", expr.to_string()),
+        None => "".to_owned(),
+    };
+
+    let query = if !full & !materialized {
+        format!(
+            "SELECT sources FROM mz_catalog.mz_sources WHERE schema_id = {} {} ORDER BY sources",
+            schema_spec.id, filter
+        )
+    } else if full & !materialized {
+        format!(
+            "SELECT sources, type, CASE WHEN count > 0 then true ELSE false END materialized
+            FROM mz_catalog.mz_sources
+            JOIN mz_catalog.mz_schemas ON mz_catalog.mz_sources.schema_id = mz_catalog.mz_schemas.schema_id
+            JOIN (SELECT mz_catalog.mz_sources.global_id as global_id, count(mz_catalog.mz_indexes.on_global_id) AS count
+                  FROM mz_catalog.mz_sources
+                  LEFT JOIN mz_catalog.mz_indexes on mz_catalog.mz_sources.global_id = mz_catalog.mz_indexes.on_global_id
+                  GROUP BY mz_catalog.mz_sources.global_id) as mz_indexes_count
+                ON mz_catalog.mz_sources.global_id = mz_indexes_count.global_id
+            WHERE schema_id = {} {}
+            ORDER BY sources, type",
+            schema_spec.id, filter
+        )
+    } else if !full & materialized {
+        format!(
+            "SELECT sources
+            FROM mz_catalog.mz_sources
+            JOIN mz_catalog.mz_schemas ON mz_catalog.mz_sources.schema_id = mz_catalog.mz_schemas.schema_id
+            JOIN (SELECT mz_catalog.mz_sources.global_id as global_id, count(mz_catalog.mz_indexes.on_global_id) AS count
+                  FROM mz_catalog.mz_sources
+                  LEFT JOIN mz_catalog.mz_indexes on mz_catalog.mz_sources.global_id = mz_catalog.mz_indexes.on_global_id
+                  GROUP BY mz_catalog.mz_sources.global_id) as mz_indexes_count
+                ON mz_catalog.mz_sources.global_id = mz_indexes_count.global_id
+            WHERE schema_id = {} {} AND mz_indexes_count.count > 0
+            ORDER BY sources, type",
+            schema_spec.id, filter
+        )
+    } else {
+        format!(
+            "SELECT sources, type
+            FROM mz_catalog.mz_sources
+            JOIN mz_catalog.mz_schemas ON mz_catalog.mz_sources.schema_id = mz_catalog.mz_schemas.schema_id
+            JOIN (SELECT mz_catalog.mz_sources.global_id as global_id, count(mz_catalog.mz_indexes.on_global_id) AS count
+                  FROM mz_catalog.mz_sources
+                  LEFT JOIN mz_catalog.mz_indexes on mz_catalog.mz_sources.global_id = mz_catalog.mz_indexes.on_global_id
+                  GROUP BY mz_catalog.mz_sources.global_id) as mz_indexes_count
+                ON mz_catalog.mz_sources.global_id = mz_indexes_count.global_id
+            WHERE schema_id = {} {} AND mz_indexes_count.count > 0
+            ORDER BY sources, type",
+            schema_spec.id, filter
+        )
+    };
+    handle_generated_select(scx, query)
+}
+
+fn handle_show_tables(
+    scx: &StatementContext,
+    extended: bool,
+    full: bool,
+    from: Option<ObjectName>,
+    filter: Option<ShowStatementFilter>,
+) -> Result<Plan, anyhow::Error> {
+    if extended {
+        unsupported!("SHOW EXTENDED TABLES");
     }
+
+    let schema_spec = if let Some(from) = from {
+        scx.resolve_schema(from)?.1
+    } else {
+        scx.resolve_default_schema()?
+    };
+    let filter = match filter {
+        Some(ShowStatementFilter::Like(like)) => format!("AND tables LIKE {}", Value::String(like)),
+        Some(ShowStatementFilter::Where(expr)) => format!("AND {}", expr.to_string()),
+        None => "".to_owned(),
+    };
+
+    let query = if full {
+        format!(
+            "SELECT tables, type
+            FROM mz_catalog.mz_tables
+            JOIN mz_catalog.mz_schemas ON mz_catalog.mz_tables.schema_id = mz_catalog.mz_schemas.schema_id
+            WHERE schema_id = {} {}
+            ORDER BY tables, type",
+            schema_spec.id, filter
+        )
+    } else {
+        format!(
+            "SELECT tables FROM mz_catalog.mz_tables WHERE schema_id = {} {} ORDER BY tables",
+            schema_spec.id, filter
+        )
+    };
+    handle_generated_select(scx, query)
 }
 
 fn handle_show_indexes(
@@ -661,53 +837,42 @@ fn handle_show_indexes(
         );
     }
 
-    let arena = RowArena::new();
-    let rows = from_entry
-        .used_by()
-        .iter()
-        .map(|id| scx.catalog.get_item_by_id(id))
-        .filter(|entry| {
-            CatalogItemType::Index == entry.item_type() && entry.uses() == vec![from_entry.id()]
-        })
-        .flat_map(|entry| {
-            let (keys, on) = entry.index_details().expect("known to be an index");
-            let key_sqls = match crate::parse::parse(entry.create_sql().to_owned())
-                .expect("create_sql cannot be invalid")
-                .into_element()
-            {
-                Statement::CreateIndex(CreateIndexStatement { key_parts, .. }) => {
-                    key_parts.unwrap()
-                }
-                _ => unreachable!(),
-            };
-            let mut row_subset = Vec::new();
-            for (i, (key_expr, key_sql)) in keys.iter().zip_eq(key_sqls).enumerate() {
-                let desc = scx.catalog.get_item_by_id(&on).desc().unwrap();
-                let key_sql = key_sql.to_string();
-                let (col_name, func) = match key_expr {
-                    expr::ScalarExpr::Column(i) => {
-                        let col_name = match desc.get_unambiguous_name(*i) {
-                            Some(col_name) => col_name.to_string(),
-                            None => format!("@{}", i + 1),
-                        };
-                        (Datum::String(arena.push_string(col_name)), Datum::Null)
-                    }
-                    _ => (Datum::Null, Datum::String(arena.push_string(key_sql))),
-                };
-                row_subset.push(vec![
-                    Datum::String(arena.push_string(from_entry.name().to_string())),
-                    Datum::String(arena.push_string(entry.name().to_string())),
-                    col_name,
-                    func,
-                    Datum::from(key_expr.typ(desc.typ()).nullable),
-                    Datum::from((i + 1) as i64),
-                ]);
-            }
-            row_subset
-        })
-        .collect();
+    let base_query = format!(
+        "SELECT
+            on_names.name as on_name,
+            index_names.name as key_name,
+            mz_catalog.mz_columns.field as column_name,
+            mz_catalog.mz_indexes.expression as expression,
+            mz_catalog.mz_indexes.nullable as nullable,
+            mz_catalog.mz_indexes.seq_in_index as seq_in_index
+        FROM
+            mz_catalog.mz_indexes
+            JOIN mz_catalog.mz_catalog_names AS on_names ON mz_catalog.mz_indexes.on_global_id = on_names.global_id
+            JOIN mz_catalog.mz_catalog_names AS index_names ON mz_catalog.mz_indexes.global_id = index_names.global_id
+            LEFT OUTER JOIN mz_catalog.mz_columns ON mz_catalog.mz_indexes.on_global_id = mz_catalog.mz_columns.global_id
+                AND mz_catalog.mz_indexes.field_number = mz_catalog.mz_columns.field_number
+        WHERE
+            on_names.name = '{}'
+        ORDER BY
+            key_name asc,
+            seq_in_index asc", from_name
+    );
 
-    finish_show_where(scx, filter, rows, &SHOW_INDEXES_DESC)
+    let query = if let Some(filter) = filter {
+        let filter = match filter {
+            ShowStatementFilter::Like(like) => format!("key_name LIKE {}", Value::String(like)),
+            ShowStatementFilter::Where(expr) => expr.to_string(),
+        };
+        format!(
+            "SELECT on_name, key_name, column_name, expression, nullable, seq_in_index
+             FROM ({})
+             WHERE {}",
+            base_query, filter,
+        )
+    } else {
+        base_query
+    };
+    handle_generated_select(scx, query)
 }
 
 /// Create an immediate result that describes all the columns for the given table
@@ -727,71 +892,24 @@ fn handle_show_columns(
         unsupported!("SHOW FULL COLUMNS");
     }
 
-    let mut selection = Expr::BinaryOp {
-        left: Box::new(Expr::Identifier(vec![Ident::new("qualified_name")])),
-        op: BinaryOperator::Eq,
-        right: Box::new(Expr::Value(Value::String(
-            scx.resolve_item(table_name)?.to_string(),
-        ))),
+    let name = scx.resolve_item(table_name)?;
+    let filter = match filter {
+        Some(ShowStatementFilter::Like(like)) => format!("AND field LIKE {}", Value::String(like)),
+        Some(ShowStatementFilter::Where(expr)) => format!("AND {}", expr.to_string()),
+        None => "".to_owned(),
     };
-    if let Some(filter) = filter {
-        let filter = match filter {
-            ShowStatementFilter::Like(l) => Expr::BinaryOp {
-                left: Box::new(Expr::Identifier(vec![Ident::new("field")])),
-                op: BinaryOperator::Like,
-                right: Box::new(Expr::Value(Value::String(l))),
-            },
-            ShowStatementFilter::Where(w) => w,
-        };
-        selection = Expr::BinaryOp {
-            left: Box::new(selection),
-            op: BinaryOperator::And,
-            right: Box::new(filter),
-        }
-    }
-
-    let select = Select::default()
-        .from(TableWithJoins {
-            relation: TableFactor::Table {
-                name: ObjectName(vec![Ident::new("mz_columns")]),
-                alias: None,
-            },
-            joins: vec![],
-        })
-        .selection(Some(selection))
-        .project(SelectItem::Expr {
-            expr: Expr::Identifier(vec![Ident::new("field".to_owned())]),
-            alias: None,
-        })
-        .project(SelectItem::Expr {
-            expr: Expr::Case {
-                operand: None,
-                conditions: vec![Expr::BinaryOp {
-                    left: Box::new(Expr::Identifier(vec![Ident::new("nullable".to_owned())])),
-                    op: BinaryOperator::Eq,
-                    right: Box::new(Expr::Value(Value::Boolean(true))),
-                }],
-                results: vec![Expr::Value(Value::String("YES".to_owned()))],
-                else_result: Some(Box::new(Expr::Value(Value::String("NO".to_owned())))),
-            },
-            alias: None,
-        })
-        .project(SelectItem::Expr {
-            expr: Expr::Identifier(vec![Ident::new("type".to_owned())]),
-            alias: None,
-        });
-
-    handle_select(
-        scx,
-        SelectStatement {
-            query: Box::new(Query::select(select)),
-            as_of: None,
-        },
-        &Params {
-            datums: Row::pack(&[]),
-            types: vec![],
-        },
-    )
+    let query = format!(
+        "SELECT
+            mz_columns.field,
+            CASE WHEN mz_columns.nullable THEN 'YES' ELSE 'NO' END nullable,
+            mz_columns.type
+         FROM mz_catalog.mz_columns AS mz_columns
+         JOIN mz_catalog.mz_catalog_names AS mz_catalog_names ON mz_columns.global_id = mz_catalog_names.global_id
+         WHERE mz_catalog_names.name = '{}' {}
+         ORDER BY mz_columns.field_number ASC",
+        name, filter
+    );
+    handle_generated_select(scx, query)
 }
 
 fn handle_show_create_view(
@@ -901,7 +1019,7 @@ fn kafka_sink_builder(
 
     let broker_addrs = broker.parse()?;
 
-    let mut with_options = normalize::with_options(&with_options);
+    let mut with_options = normalize::options(&with_options);
     let include_consistency = match with_options.remove("consistency") {
         Some(Value::Boolean(b)) => b,
         None => false,
@@ -1198,9 +1316,8 @@ fn handle_create_view(
         None
     };
     let (mut relation_expr, mut desc, finishing) =
-        query::plan_root_query(scx, *query.clone(), QueryLifetime::Static)?;
-    // TODO(jamii) can views even have parameters?
-    relation_expr.bind_parameters(&params);
+        query::plan_root_query(scx, query.clone(), QueryLifetime::Static)?;
+    relation_expr.bind_parameters(&params)?;
     //TODO: materialize#724 - persist finishing information with the view?
     relation_expr.finish(finishing);
     let relation_expr = relation_expr.decorrelate();
@@ -1279,11 +1396,11 @@ fn handle_create_source(
                     } => {
                         let url: Url = url.parse()?;
                         let kafka_options =
-                            kafka_util::extract_config(&normalize::with_options(with_options))?;
+                            kafka_util::extract_config(&normalize::options(with_options))?;
                         let ccsr_config = kafka_util::generate_ccsr_client_config(
                             url,
                             &kafka_options,
-                            &normalize::with_options(ccsr_options),
+                            &normalize::options(ccsr_options),
                         )?;
 
                         if let Some(seed) = seed {
@@ -1354,7 +1471,7 @@ fn handle_create_source(
         })
     };
 
-    let mut with_options = normalize::with_options(with_options);
+    let mut with_options = normalize::options(with_options);
 
     let mut consistency = Consistency::RealTime;
     let mut ts_frequency = Duration::from_secs(1);
@@ -1401,6 +1518,10 @@ fn handle_create_source(
                 Some(Value::Boolean(b)) => b,
                 Some(_) => bail!("persistence must be a bool!"),
             };
+
+            if enable_persistence && consistency != Consistency::RealTime {
+                unsupported!("BYO source persistence")
+            }
 
             let mut start_offsets = HashMap::new();
             start_offsets.insert(0, start_offset);
@@ -1664,8 +1785,6 @@ fn handle_create_table(
     scx: &StatementContext,
     stmt: CreateTableStatement,
 ) -> Result<Plan, anyhow::Error> {
-    scx.require_experimental_mode("CREATE TABLE")?;
-
     let CreateTableStatement {
         name,
         columns,
@@ -1797,24 +1916,24 @@ fn handle_drop_schema(
         unsupported!("DROP SCHEMA with multiple schemas");
     }
     match scx.resolve_schema(names.into_element()) {
-        Ok((database_spec, schema_name)) => {
+        Ok((database_spec, schema_spec)) => {
             if let DatabaseSpecifier::Ambient = database_spec {
                 bail!(
                     "cannot drop schema {} because it is required by the database system",
-                    schema_name
+                    schema_spec.name
                 );
             }
-            let mut items = scx.catalog.list_items(&database_spec, &schema_name);
+            let mut items = scx.catalog.list_items(&database_spec, &schema_spec.name);
             if !cascade && items.next().is_some() {
                 bail!(
                     "schema '{}.{}' cannot be dropped without CASCADE while it contains objects",
                     database_spec,
-                    schema_name
+                    schema_spec.name
                 );
             }
             Ok(Plan::DropSchema {
                 database_name: database_spec,
-                schema_name,
+                schema_name: schema_spec.name,
             })
         }
         Err(_) if if_exists => {
@@ -1903,71 +2022,17 @@ fn handle_insert(
         columns,
         source,
     }: InsertStatement,
+    params: &Params,
 ) -> Result<Plan, anyhow::Error> {
-    scx.require_experimental_mode("INSERT")?;
-
     if !columns.is_empty() {
         unsupported!("INSERT statement with specified columns");
     }
 
-    match source {
-        InsertSource::Query(query) => {
-            let table = scx.catalog.get_item(&scx.resolve_item(table_name)?);
-            if table.id().is_system() {
-                bail!("cannot insert into system table '{}'", table.name());
-            }
-            if table.item_type() != CatalogItemType::Table {
-                bail!(
-                    "cannot insert into {} '{}'",
-                    table.item_type(),
-                    table.name()
-                );
-            }
-            if let SetExpr::Values(values) = &query.body {
-                let column_info: Vec<(Option<&ColumnName>, &ColumnType)> =
-                    table.desc()?.iter().collect();
-                let relation_expr = query::plan_insert_query(
-                    scx,
-                    values,
-                    Some(
-                        table
-                            .desc()?
-                            .iter_types()
-                            .map(|typ| &typ.scalar_type)
-                            .collect(),
-                    ),
-                )?
-                .decorrelate();
+    let (id, mut expr) = query::plan_insert_query(scx, table_name, source)?;
+    expr.bind_parameters(&params)?;
+    let expr = expr.decorrelate();
 
-                let column_types = relation_expr.typ().column_types;
-                if column_types.len() != column_info.len() {
-                    bail!(
-                        "INSERT statement specifies {} columns, but table has {} columns",
-                        column_info.len(),
-                        column_types.len()
-                    );
-                }
-                for ((name, exp_typ), typ) in column_info.iter().zip(&column_types) {
-                    if typ.scalar_type != exp_typ.scalar_type {
-                        bail!(
-                            "expected type {} for column {}, found {}",
-                            exp_typ.scalar_type,
-                            name.unwrap_or(&ColumnName::from("unnamed column")),
-                            typ,
-                        );
-                    }
-                }
-
-                Ok(Plan::Insert {
-                    id: table.id(),
-                    values: relation_expr,
-                })
-            } else {
-                unsupported!(format!("INSERT body {}", query.body));
-            }
-        }
-        InsertSource::DefaultValues => unsupported!("INSERT DEFAULT VALUES"),
-    }
+    Ok(Plan::Insert { id, values: expr })
 }
 
 fn handle_select(
@@ -1975,7 +2040,7 @@ fn handle_select(
     SelectStatement { query, as_of }: SelectStatement,
     params: &Params,
 ) -> Result<Plan, anyhow::Error> {
-    let (relation_expr, _, finishing) = handle_query(scx, *query, params, QueryLifetime::OneShot)?;
+    let (relation_expr, _, finishing) = handle_query(scx, query, params, QueryLifetime::OneShot)?;
     let when = match as_of.map(|e| query::eval_as_of(scx, e)).transpose()? {
         Some(ts) => PeekWhen::AtTimestamp(ts),
         None => PeekWhen::Immediately,
@@ -1987,6 +2052,20 @@ fn handle_select(
         finishing,
         materialize: true,
     })
+}
+
+fn handle_generated_select(scx: &StatementContext, query: String) -> Result<Plan, anyhow::Error> {
+    match parse(query)?.into_element() {
+        Statement::Select(SelectStatement { query, as_of: _ }) => handle_select(
+            scx,
+            SelectStatement { query, as_of: None },
+            &Params {
+                datums: Row::pack(&[]),
+                types: vec![],
+            },
+        ),
+        _ => unreachable!("known to be select statement"),
+    }
 }
 
 fn handle_explain(
@@ -2025,7 +2104,7 @@ fn handle_explain(
                 catalog: scx.catalog,
                 param_types: scx.param_types.clone(),
             };
-            (scx, *query)
+            (scx, query)
         }
         Explainee::Query(query) => (scx.clone(), query),
     };
@@ -2042,7 +2121,7 @@ fn handle_explain(
     } else {
         Some(finishing)
     };
-    sql_expr.bind_parameters(&params);
+    sql_expr.bind_parameters(&params)?;
     let expr = sql_expr.clone().decorrelate();
     Ok(Plan::ExplainPlan {
         raw_plan: sql_expr,
@@ -2062,7 +2141,7 @@ fn handle_query(
     lifetime: QueryLifetime,
 ) -> Result<(::expr::RelationExpr, RelationDesc, RowSetFinishing), anyhow::Error> {
     let (mut expr, desc, finishing) = query::plan_root_query(scx, query, lifetime)?;
-    expr.bind_parameters(&params);
+    expr.bind_parameters(&params)?;
     Ok((expr.decorrelate(), desc, finishing))
 }
 
@@ -2138,6 +2217,12 @@ impl<'a> StatementContext<'a> {
         Ok(DatabaseSpecifier::Name(name.into()))
     }
 
+    pub fn resolve_default_schema(&self) -> Result<SchemaSpecifier, PlanError> {
+        Ok(self
+            .resolve_schema(ObjectName(vec![Ident::new("public")]))?
+            .1)
+    }
+
     pub fn resolve_database(&self, name: ObjectName) -> Result<String, PlanError> {
         if name.0.len() != 1 {
             return Err(PlanError::OverqualifiedDatabaseName(name.to_string()));
@@ -2154,14 +2239,13 @@ impl<'a> StatementContext<'a> {
     pub fn resolve_schema(
         &self,
         mut name: ObjectName,
-    ) -> Result<(DatabaseSpecifier, String), PlanError> {
+    ) -> Result<(DatabaseSpecifier, SchemaSpecifier), PlanError> {
         if name.0.len() > 2 {
             return Err(PlanError::OverqualifiedSchemaName(name.to_string()));
         }
         let schema_name = normalize::ident(name.0.pop().unwrap());
         let database_spec = name.0.pop().map(normalize::ident);
-        let database_spec = self.catalog.resolve_schema(database_spec, &schema_name)?;
-        Ok((database_spec, schema_name))
+        Ok(self.catalog.resolve_schema(database_spec, &schema_name)?)
     }
 
     pub fn resolve_item(&self, name: ObjectName) -> Result<FullName, PlanError> {
@@ -2184,7 +2268,15 @@ impl<'a> StatementContext<'a> {
         Ok(())
     }
 
-    pub fn unwrap_param_types(self) -> BTreeMap<usize, ScalarType> {
-        Rc::try_unwrap(self.param_types).unwrap().into_inner()
+    pub fn finalize_param_types(self) -> Result<Vec<ScalarType>, anyhow::Error> {
+        let param_types = Rc::try_unwrap(self.param_types).unwrap().into_inner();
+        let mut out = vec![];
+        for (i, (n, typ)) in param_types.into_iter().enumerate() {
+            if n != i + 1 {
+                bail!("unable to infer type for parameter ${}", i + 1);
+            }
+            out.push(typ);
+        }
+        Ok(out)
     }
 }

@@ -12,9 +12,9 @@ use std::collections::{HashMap, HashSet};
 use std::convert::TryFrom;
 use std::fmt;
 use std::io::Read;
-use std::iter;
+use std::{cell::RefCell, iter, rc::Rc};
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail};
 use byteorder::{BigEndian, ByteOrder, NetworkEndian, WriteBytesExt};
 use chrono::Timelike;
 use itertools::Itertools;
@@ -23,16 +23,19 @@ use log::warn;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::Sha256;
+use uuid::Uuid;
 
-use avro::schema::{
+use mz_avro::schema::{
     resolve_schemas, RecordField, Schema, SchemaFingerprint, SchemaNode, SchemaPiece,
     SchemaPieceOrNamed,
 };
-use avro::{
+use mz_avro::{
+    define_unexpected,
+    error::{DecodeError, Error as AvroError},
     give_value,
     types::{DecimalValue, Scalar, Value},
     AvroArrayAccess, AvroDecode, AvroDeserializer, AvroRead, AvroRecordAccess, GeneralDeserializer,
-    TrivialDecoder, ValueDecoder, ValueOrReader,
+    StatefulAvroDecodeable, TrivialDecoder, ValueDecoder, ValueOrReader,
 };
 use repr::adt::decimal::{Significand, MAX_DECIMAL_PRECISION};
 use repr::adt::jsonb::{JsonbPacker, JsonbRef};
@@ -79,7 +82,10 @@ lazy_static! {
 /// type with the same type. If the schema is valid, returns a
 /// vector describing the order and position of the primary key
 /// columns.
-pub fn validate_key_schema(key_schema: &str, value_desc: &RelationDesc) -> Result<Vec<usize>> {
+pub fn validate_key_schema(
+    key_schema: &str,
+    value_desc: &RelationDesc,
+) -> anyhow::Result<Vec<usize>> {
     let key_schema = parse_schema(key_schema)?;
     let key_desc = validate_schema_1(key_schema.top_node())?;
     let mut indices = Vec::new();
@@ -132,7 +138,10 @@ impl<'a> AvroStringDecoder<'a> {
 
 impl<'a> AvroDecode for AvroStringDecoder<'a> {
     type Out = ();
-    fn string<'b, R: AvroRead>(self, r: ValueOrReader<'b, &'b str, R>) -> Result<Self::Out> {
+    fn string<'b, R: AvroRead>(
+        self,
+        r: ValueOrReader<'b, &'b str, R>,
+    ) -> Result<Self::Out, AvroError> {
         match r {
             ValueOrReader::Value(val) => {
                 self.buf.resize_with(val.len(), Default::default);
@@ -144,6 +153,9 @@ impl<'a> AvroDecode for AvroStringDecoder<'a> {
             }
         }
         Ok(())
+    }
+    define_unexpected! {
+        record, union_branch, array, map, enum_variant, scalar, decimal, bytes, json, uuid, fixed
     }
 }
 
@@ -162,12 +174,12 @@ impl AvroDecode for AvroDbzSnapshotDecoder {
         _idx: usize,
         _n_variants: usize,
         _null_variant: Option<usize>,
-        deserializer: &'a mut D,
+        deserializer: D,
         reader: &'a mut R,
-    ) -> Result<Self::Out> {
+    ) -> Result<Self::Out, AvroError> {
         deserializer.deserialize(reader, self)
     }
-    fn scalar(self, scalar: Scalar) -> Result<Self::Out> {
+    fn scalar(self, scalar: Scalar) -> Result<Self::Out, AvroError> {
         match scalar {
             Scalar::Null => Ok(None),
             Scalar::Boolean(val) => Ok(Some(if val {
@@ -175,10 +187,15 @@ impl AvroDecode for AvroDbzSnapshotDecoder {
             } else {
                 DbzSnapshot::False
             })),
-            _ => bail!("`snapshot` value had unexpected type"),
+            _ => {
+                Err(DecodeError::Custom("`snapshot` value had unexpected type".to_string()).into())
+            }
         }
     }
-    fn string<'a, R: AvroRead>(self, r: ValueOrReader<'a, &'a str, R>) -> Result<Self::Out> {
+    fn string<'a, R: AvroRead>(
+        self,
+        r: ValueOrReader<'a, &'a str, R>,
+    ) -> Result<Self::Out, AvroError> {
         let mut s = SmallVec::<[u8; 8]>::new();
         let s = match r {
             ValueOrReader::Value(val) => val.as_bytes(),
@@ -192,17 +209,26 @@ impl AvroDecode for AvroDbzSnapshotDecoder {
             b"true" => DbzSnapshot::True,
             b"last" => DbzSnapshot::Last,
             b"false" => DbzSnapshot::False,
-            _ => bail!(
-                "`snapshot` had unexpected value {}",
-                String::from_utf8_lossy(s)
-            ),
+            _ => {
+                return Err(DecodeError::Custom(format!(
+                    "`snapshot` had unexpected value {}",
+                    String::from_utf8_lossy(s)
+                ))
+                .into())
+            }
         }))
+    }
+    define_unexpected! {
+        record, array, map, enum_variant, decimal, bytes, json, uuid, fixed
     }
 }
 
 impl<'a> AvroDecode for DebeziumSourceDecoder<'a> {
     type Out = DebeziumSourceCoordinates;
-    fn record<R: AvroRead, A: AvroRecordAccess<R>>(self, a: &mut A) -> Result<Self::Out> {
+    fn record<R: AvroRead, A: AvroRecordAccess<R>>(
+        self,
+        a: &mut A,
+    ) -> Result<Self::Out, AvroError> {
         let mut snapshot = false;
         // Binlog file "pos" and "row" - present in MySQL sources.
         let mut pos = None;
@@ -224,19 +250,17 @@ impl<'a> AvroDecode for DebeziumSourceDecoder<'a> {
                     let next = ValueDecoder;
                     let val = field.decode_field(next)?;
 
-                    pos = Some(
-                        val.into_integral()
-                            .ok_or_else(|| anyhow!("\"pos\" is not an integer"))?,
-                    );
+                    pos = Some(val.into_integral().ok_or_else(|| {
+                        DecodeError::Custom("\"pos\" is not an integer".to_string())
+                    })?);
                 }
                 "row" => {
                     let next = ValueDecoder;
                     let val = field.decode_field(next)?;
 
-                    row = Some(
-                        val.into_integral()
-                            .ok_or_else(|| anyhow!("\"row\" is not an integer"))?,
-                    );
+                    row = Some(val.into_integral().ok_or_else(|| {
+                        DecodeError::Custom("\"row\" is not an integer".to_string())
+                    })?);
                 }
                 "file" => {
                     let d = AvroStringDecoder::with_buf(self.file_buf);
@@ -250,10 +274,9 @@ impl<'a> AvroDecode for DebeziumSourceDecoder<'a> {
                         Value::Union { inner, .. } => *inner,
                         val => val,
                     };
-                    lsn = Some(
-                        val.into_integral()
-                            .ok_or_else(|| anyhow!("\"lsn\" is not an integer"))?,
-                    );
+                    lsn = Some(val.into_integral().ok_or_else(|| {
+                        DecodeError::Custom("\"lsn\" is not an integer".to_string())
+                    })?);
                 }
                 _ => {
                     field.decode_field(TrivialDecoder)?;
@@ -264,19 +287,23 @@ impl<'a> AvroDecode for DebeziumSourceDecoder<'a> {
         let pg_any = lsn.is_some();
         let row = if mysql_any {
             if pg_any {
-                bail!("Found both MySQL (file/pos/row) and Postgres (LSN) source coordinates! We don't know how to interpret this.")
+                return Err(DecodeError::Custom(
+                "Found both MySQL (file/pos/row) and Postgres (LSN) source coordinates! We don't know how to interpret this.".to_string()).into());
             }
-            let pos = pos.ok_or_else(|| anyhow!("no pos"))? as usize;
-            let row = row.ok_or_else(|| anyhow!("no row"))? as usize;
+            let pos = pos.ok_or_else(|| DecodeError::Custom("no pos".to_string()))? as usize;
+            let row = row.ok_or_else(|| DecodeError::Custom("no row".to_string()))? as usize;
             if !has_file {
-                bail!("no file");
+                return Err(DecodeError::Custom("no file".to_string()).into());
             }
             RowCoordinates::MySql { pos, row }
         } else {
-            let lsn = lsn.ok_or_else(|| anyhow!("no LSN"))? as usize;
+            let lsn = lsn.ok_or_else(|| DecodeError::Custom("no lsn".to_string()))? as usize;
             RowCoordinates::Postgres { lsn }
         };
         Ok(DebeziumSourceCoordinates { snapshot, row })
+    }
+    define_unexpected! {
+        union_branch, array, map, enum_variant, scalar, decimal, bytes, string, json, uuid, fixed
     }
 }
 struct OptionalRowDecoder<'a> {
@@ -291,9 +318,9 @@ impl<'a> AvroDecode for OptionalRowDecoder<'a> {
         idx: usize,
         _n_variants: usize,
         null_variant: Option<usize>,
-        deserializer: &'b mut D,
+        deserializer: D,
         reader: &'b mut R,
-    ) -> Result<Self::Out> {
+    ) -> Result<Self::Out, AvroError> {
         if Some(idx) == null_variant {
             // we are done, the row is null!
             Ok(false)
@@ -307,6 +334,9 @@ impl<'a> AvroDecode for OptionalRowDecoder<'a> {
             Ok(true)
         }
     }
+    define_unexpected! {
+        record, array, map, enum_variant, scalar, decimal, bytes, string, json, uuid, fixed
+    }
 }
 
 #[derive(Debug)]
@@ -318,7 +348,10 @@ pub struct AvroDebeziumDecoder<'a> {
 
 impl<'a> AvroDecode for AvroDebeziumDecoder<'a> {
     type Out = (DiffPair<Row>, Option<DebeziumSourceCoordinates>);
-    fn record<R: AvroRead, A: AvroRecordAccess<R>>(self, a: &mut A) -> Result<Self::Out> {
+    fn record<R: AvroRead, A: AvroRecordAccess<R>>(
+        self,
+        a: &mut A,
+    ) -> Result<Self::Out, AvroError> {
         let mut before = None;
         let mut after = None;
         let mut coords = None;
@@ -365,6 +398,49 @@ impl<'a> AvroDecode for AvroDebeziumDecoder<'a> {
         }
         Ok((DiffPair { before, after }, coords))
     }
+    define_unexpected! {
+        union_branch, array, map, enum_variant, scalar, decimal, bytes, string, json, uuid, fixed
+    }
+}
+
+struct RowDecoder {
+    state: (Rc<RefCell<RowPacker>>, Rc<RefCell<Vec<u8>>>),
+}
+
+impl AvroDecode for RowDecoder {
+    type Out = RowWrapper;
+    fn record<R: AvroRead, A: AvroRecordAccess<R>>(
+        self,
+        a: &mut A,
+    ) -> Result<Self::Out, AvroError> {
+        let mut packer_borrow = self.state.0.borrow_mut();
+        let mut buf_borrow = self.state.1.borrow_mut();
+        let inner = AvroFlatDecoder {
+            packer: &mut packer_borrow,
+            buf: &mut buf_borrow,
+            is_top: true,
+        };
+        inner.record(a)?;
+        let row = packer_borrow.finish_and_reuse();
+        Ok(RowWrapper(row))
+    }
+    define_unexpected! {
+        union_branch, array, map, enum_variant, scalar, decimal, bytes, string, json, uuid, fixed
+    }
+}
+
+// Get around orphan rule
+#[derive(Debug)]
+struct RowWrapper(Row);
+impl StatefulAvroDecodeable for RowWrapper {
+    type Decoder = RowDecoder;
+    // TODO - can we make this some sort of &'a mut (RowPacker, Vec<u8>) without
+    // running into lifetime crap?
+    type State = (Rc<RefCell<RowPacker>>, Rc<RefCell<Vec<u8>>>);
+
+    fn new_decoder(state: Self::State) -> Self::Decoder {
+        Self::Decoder { state }
+    }
 }
 
 #[derive(Debug)]
@@ -377,9 +453,12 @@ pub struct AvroFlatDecoder<'a> {
 impl<'a> AvroDecode for AvroFlatDecoder<'a> {
     type Out = ();
     #[inline]
-    fn record<R: AvroRead, A: AvroRecordAccess<R>>(self, a: &mut A) -> Result<Self::Out> {
+    fn record<R: AvroRead, A: AvroRecordAccess<R>>(
+        self,
+        a: &mut A,
+    ) -> Result<Self::Out, AvroError> {
         let mut str_buf = std::mem::take(self.buf);
-        let mut pack_record = |rp: &mut RowPacker| -> Result<()> {
+        let mut pack_record = |rp: &mut RowPacker| -> Result<(), AvroError> {
             let mut expected = 0;
             let mut stash = vec![];
             // The idea here is that if the deserializer gives us fields in the order we're expecting,
@@ -433,14 +512,15 @@ impl<'a> AvroDecode for AvroFlatDecoder<'a> {
         idx: usize,
         n_variants: usize,
         null_variant: Option<usize>,
-        deserializer: &'b mut D,
+        deserializer: D,
         reader: &'b mut R,
-    ) -> Result<Self::Out> {
+    ) -> Result<Self::Out, AvroError> {
         if null_variant == Some(idx) {
             for _ in 0..n_variants - 1 {
                 self.packer.push(Datum::Null)
             }
         } else {
+            let mut deserializer = Some(deserializer);
             for i in 0..n_variants {
                 let dec = AvroFlatDecoder {
                     packer: self.packer,
@@ -449,7 +529,7 @@ impl<'a> AvroDecode for AvroFlatDecoder<'a> {
                 };
                 if null_variant != Some(i) {
                     if i == idx {
-                        deserializer.deserialize(reader, dec)?;
+                        deserializer.take().unwrap().deserialize(reader, dec)?;
                     } else {
                         self.packer.push(Datum::Null)
                     }
@@ -460,27 +540,31 @@ impl<'a> AvroDecode for AvroFlatDecoder<'a> {
     }
 
     #[inline]
-    fn enum_variant(self, symbol: &str, _idx: usize) -> Result<Self::Out> {
+    fn enum_variant(self, symbol: &str, _idx: usize) -> Result<Self::Out, AvroError> {
         self.packer.push(Datum::String(symbol));
         Ok(())
     }
     #[inline]
-    fn scalar(self, scalar: avro::types::Scalar) -> Result<Self::Out> {
+    fn scalar(self, scalar: mz_avro::types::Scalar) -> Result<Self::Out, AvroError> {
         match scalar {
-            avro::types::Scalar::Null => self.packer.push(Datum::Null),
-            avro::types::Scalar::Boolean(val) => {
+            mz_avro::types::Scalar::Null => self.packer.push(Datum::Null),
+            mz_avro::types::Scalar::Boolean(val) => {
                 if val {
                     self.packer.push(Datum::True)
                 } else {
                     self.packer.push(Datum::False)
                 }
             }
-            avro::types::Scalar::Int(val) => self.packer.push(Datum::Int32(val)),
-            avro::types::Scalar::Long(val) => self.packer.push(Datum::Int64(val)),
-            avro::types::Scalar::Float(val) => self.packer.push(Datum::Float32(OrderedFloat(val))),
-            avro::types::Scalar::Double(val) => self.packer.push(Datum::Float64(OrderedFloat(val))),
-            avro::types::Scalar::Date(val) => self.packer.push(Datum::Date(val)),
-            avro::types::Scalar::Timestamp(val) => self.packer.push(Datum::Timestamp(val)),
+            mz_avro::types::Scalar::Int(val) => self.packer.push(Datum::Int32(val)),
+            mz_avro::types::Scalar::Long(val) => self.packer.push(Datum::Int64(val)),
+            mz_avro::types::Scalar::Float(val) => {
+                self.packer.push(Datum::Float32(OrderedFloat(val)))
+            }
+            mz_avro::types::Scalar::Double(val) => {
+                self.packer.push(Datum::Float64(OrderedFloat(val)))
+            }
+            mz_avro::types::Scalar::Date(val) => self.packer.push(Datum::Date(val)),
+            mz_avro::types::Scalar::Timestamp(val) => self.packer.push(Datum::Timestamp(val)),
         }
         Ok(())
     }
@@ -490,7 +574,7 @@ impl<'a> AvroDecode for AvroFlatDecoder<'a> {
         _precision: usize,
         _scale: usize,
         r: ValueOrReader<'b, &'b [u8], R>,
-    ) -> Result<Self::Out> {
+    ) -> Result<Self::Out, AvroError> {
         let buf = match r {
             ValueOrReader::Value(val) => val,
             ValueOrReader::Reader { len, r } => {
@@ -499,12 +583,17 @@ impl<'a> AvroDecode for AvroFlatDecoder<'a> {
                 &self.buf
             }
         };
-        self.packer
-            .push(Datum::Decimal(Significand::from_twos_complement_be(buf)?));
+        self.packer.push(Datum::Decimal(
+            Significand::from_twos_complement_be(buf)
+                .map_err(|e| DecodeError::Custom(e.to_string()))?,
+        ));
         Ok(())
     }
     #[inline]
-    fn bytes<'b, R: AvroRead>(self, r: ValueOrReader<'b, &'b [u8], R>) -> Result<Self::Out> {
+    fn bytes<'b, R: AvroRead>(
+        self,
+        r: ValueOrReader<'b, &'b [u8], R>,
+    ) -> Result<Self::Out, AvroError> {
         let buf = match r {
             ValueOrReader::Value(val) => val,
             ValueOrReader::Reader { len, r } => {
@@ -517,7 +606,10 @@ impl<'a> AvroDecode for AvroFlatDecoder<'a> {
         Ok(())
     }
     #[inline]
-    fn string<'b, R: AvroRead>(self, r: ValueOrReader<'b, &'b str, R>) -> Result<Self::Out> {
+    fn string<'b, R: AvroRead>(
+        self,
+        r: ValueOrReader<'b, &'b str, R>,
+    ) -> Result<Self::Out, AvroError> {
         let s = match r {
             ValueOrReader::Value(val) => val,
             ValueOrReader::Reader { len, r } => {
@@ -527,7 +619,7 @@ impl<'a> AvroDecode for AvroFlatDecoder<'a> {
                 // It probably doesn't make a huge difference though.
                 self.buf.resize_with(len, Default::default);
                 r.read_exact(self.buf)?;
-                std::str::from_utf8(&self.buf)?
+                std::str::from_utf8(&self.buf).map_err(|_| DecodeError::StringUtf8Error)?
             }
         };
         self.packer.push(Datum::String(s));
@@ -537,30 +629,54 @@ impl<'a> AvroDecode for AvroFlatDecoder<'a> {
     fn json<'b, R: AvroRead>(
         self,
         r: ValueOrReader<'b, &'b serde_json::Value, R>,
-    ) -> Result<Self::Out> {
+    ) -> Result<Self::Out, AvroError> {
         match r {
             ValueOrReader::Value(val) => {
-                *self.packer =
-                    JsonbPacker::new(std::mem::take(self.packer)).pack_serde_json(val.clone())?;
+                *self.packer = JsonbPacker::new(std::mem::take(self.packer))
+                    .pack_serde_json(val.clone())
+                    .map_err(|e| DecodeError::Custom(e.to_string()))?;
             }
             ValueOrReader::Reader { len, r } => {
                 self.buf.resize_with(len, Default::default);
                 r.read_exact(self.buf)?;
-                *self.packer =
-                    JsonbPacker::new(std::mem::take(self.packer)).pack_slice(&self.buf)?;
+                *self.packer = JsonbPacker::new(std::mem::take(self.packer))
+                    .pack_slice(&self.buf)
+                    .map_err(|e| DecodeError::Custom(e.to_string()))?;
             }
         }
         Ok(())
     }
     #[inline]
-    fn fixed<'b, R: AvroRead>(self, r: ValueOrReader<'b, &'b [u8], R>) -> Result<Self::Out> {
+    fn uuid<'b, R: AvroRead>(
+        self,
+        r: ValueOrReader<'b, &'b [u8], R>,
+    ) -> Result<Self::Out, AvroError> {
+        let buf = match r {
+            ValueOrReader::Value(val) => val,
+            ValueOrReader::Reader { len, r } => {
+                self.buf.resize_with(len, Default::default);
+                r.read_exact(self.buf)?;
+                &self.buf
+            }
+        };
+        let s = std::str::from_utf8(&buf).map_err(|_e| DecodeError::UuidUtf8Error)?;
+        self.packer.push(Datum::Uuid(
+            Uuid::parse_str(s).map_err(DecodeError::BadUuid)?,
+        ));
+        Ok(())
+    }
+    #[inline]
+    fn fixed<'b, R: AvroRead>(
+        self,
+        r: ValueOrReader<'b, &'b [u8], R>,
+    ) -> Result<Self::Out, AvroError> {
         self.bytes(r)
     }
     #[inline]
-    fn array<A: AvroArrayAccess>(mut self, a: &mut A) -> Result<Self::Out> {
+    fn array<A: AvroArrayAccess>(mut self, a: &mut A) -> Result<Self::Out, AvroError> {
         self.is_top = false;
         let mut str_buf = std::mem::take(self.buf);
-        self.packer.push_list_with(|rp| -> Result<()> {
+        self.packer.push_list_with(|rp| -> Result<(), AvroError> {
             loop {
                 let next = AvroFlatDecoder {
                     packer: rp,
@@ -576,13 +692,14 @@ impl<'a> AvroDecode for AvroFlatDecoder<'a> {
         *self.buf = str_buf;
         Ok(())
     }
+    define_unexpected! {map}
 }
 
 /// Converts an Apache Avro schema into a list of column names and types.
 pub fn validate_value_schema(
     schema: &str,
     envelope: EnvelopeType,
-) -> Result<Vec<(ColumnName, ColumnType)>> {
+) -> anyhow::Result<Vec<(ColumnName, ColumnType)>> {
     let schema = parse_schema(schema)?;
     let node = schema.top_node();
 
@@ -673,7 +790,7 @@ pub fn validate_value_schema(
     validate_schema_1(node.step(row_schema))
 }
 
-fn validate_schema_1(schema: SchemaNode) -> Result<Vec<(ColumnName, ColumnType)>> {
+fn validate_schema_1(schema: SchemaNode) -> anyhow::Result<Vec<(ColumnName, ColumnType)>> {
     match schema.inner {
         SchemaPiece::Record { fields, .. } => {
             let mut columns = vec![];
@@ -695,7 +812,7 @@ fn get_named_columns<'a>(
     seen_avro_nodes: &mut HashSet<usize>,
     schema: SchemaNode<'a>,
     base_name: &str,
-) -> Result<Vec<(ColumnName, ColumnType)>> {
+) -> anyhow::Result<Vec<(ColumnName, ColumnType)>> {
     if let SchemaPiece::Union(us) = schema.inner {
         let mut columns = vec![];
         let vs = us.variants();
@@ -751,7 +868,7 @@ fn get_named_columns<'a>(
 fn validate_schema_2(
     seen_avro_nodes: &mut HashSet<usize>,
     schema: SchemaNode,
-) -> Result<ScalarType> {
+) -> anyhow::Result<ScalarType> {
     Ok(match schema.inner {
         SchemaPiece::Null => bail!("null outside of union types is not supported"),
         SchemaPiece::Boolean => ScalarType::Bool,
@@ -777,6 +894,7 @@ fn validate_schema_2(
         SchemaPiece::String | SchemaPiece::Enum { .. } => ScalarType::String,
 
         SchemaPiece::Json => ScalarType::Jsonb,
+        SchemaPiece::Uuid => ScalarType::Uuid,
         SchemaPiece::Record { fields, .. } => {
             let mut columns = vec![];
             for f in fields {
@@ -831,9 +949,9 @@ fn validate_schema_2(
     })
 }
 
-pub fn parse_schema(schema: &str) -> Result<Schema> {
+pub fn parse_schema(schema: &str) -> anyhow::Result<Schema> {
     let schema = serde_json::from_str(schema)?;
-    Schema::parse(&schema)
+    Ok(Schema::parse(&schema)?)
 }
 
 fn is_null(schema: &SchemaPieceOrNamed) -> bool {
@@ -843,7 +961,7 @@ fn is_null(schema: &SchemaPieceOrNamed) -> bool {
     }
 }
 
-fn pack_value(v: Value, mut row: RowPacker, n: SchemaNode) -> Result<RowPacker> {
+fn pack_value(v: Value, mut row: RowPacker, n: SchemaNode) -> anyhow::Result<RowPacker> {
     match v {
         Value::Null => row.push(Datum::Null),
         Value::Boolean(true) => row.push(Datum::True),
@@ -880,6 +998,7 @@ fn pack_value(v: Value, mut row: RowPacker, n: SchemaNode) -> Result<RowPacker> 
             }
         }
         Value::Json(j) => row = JsonbPacker::new(row).pack_serde_json(j)?,
+        Value::Uuid(u) => row.push(Datum::Uuid(u)),
         other @ Value::Fixed(..)
         | other @ Value::Array(_)
         | other @ Value::Map(_)
@@ -888,7 +1007,7 @@ fn pack_value(v: Value, mut row: RowPacker, n: SchemaNode) -> Result<RowPacker> 
     Ok(row)
 }
 
-pub fn extract_nullable_row<'a, I>(v: Value, extra: I, n: SchemaNode) -> Result<Option<Row>>
+pub fn extract_nullable_row<'a, I>(v: Value, extra: I, n: SchemaNode) -> anyhow::Result<Option<Row>>
 where
     I: IntoIterator<Item = Datum<'a>>,
 {
@@ -906,7 +1025,7 @@ where
     extract_row(v, extra, n)
 }
 
-pub fn extract_row<'a, I>(v: Value, extra: I, n: SchemaNode) -> Result<Option<Row>>
+pub fn extract_row<'a, I>(v: Value, extra: I, n: SchemaNode) -> anyhow::Result<Option<Row>>
 where
     I: IntoIterator<Item = Datum<'a>>,
 {
@@ -1115,7 +1234,7 @@ fn take_field_by_index(
     idx: usize,
     expected_name: &str,
     fields: &mut [(String, Value)],
-) -> Result<Value> {
+) -> anyhow::Result<Value> {
     let (name, value) = fields.get_mut(idx).ok_or_else(|| {
         anyhow!(
             "Value does not match schema: \"{}\" field not at index {}",
@@ -1161,8 +1280,8 @@ impl DebeziumDecodeState {
         v: Value,
         n: SchemaNode,
         coord: Option<i64>,
-    ) -> Result<DiffPair<Row>> {
-        fn is_snapshot(v: Value) -> Result<Option<bool>> {
+    ) -> anyhow::Result<DiffPair<Row>> {
+        fn is_snapshot(v: Value) -> anyhow::Result<Option<bool>> {
             let answer = match v {
                 Value::Union { inner, .. } => is_snapshot(*inner)?,
                 Value::Boolean(b) => Some(b),
@@ -1289,7 +1408,7 @@ impl Decoder {
         debug_name: String,
         worker_index: usize,
         debezium_dedup: Option<DebeziumDeduplicationStrategy>,
-    ) -> Result<Decoder> {
+    ) -> anyhow::Result<Decoder> {
         assert!(
             (envelope == EnvelopeType::Debezium && debezium_dedup.is_some())
                 || (envelope != EnvelopeType::Debezium && debezium_dedup.is_none())
@@ -1315,7 +1434,11 @@ impl Decoder {
     }
 
     /// Decodes Avro-encoded `bytes` into a `DiffPair`.
-    pub async fn decode(&mut self, mut bytes: &[u8], coord: Option<i64>) -> Result<DiffPair<Row>> {
+    pub async fn decode(
+        &mut self,
+        mut bytes: &[u8],
+        coord: Option<i64>,
+    ) -> anyhow::Result<DiffPair<Row>> {
         // The first byte is a magic byte (0) that indicates the Confluent
         // serialization format version, and the next four bytes are a big
         // endian 32-bit schema ID.
@@ -1336,10 +1459,7 @@ impl Decoder {
         }
 
         let resolved_schema = match &mut self.writer_schemas {
-            Some(cache) => cache
-                .get(schema_id, &self.reader_schema)
-                .await?
-                .unwrap_or(&self.reader_schema),
+            Some(cache) => cache.get(schema_id, &self.reader_schema).await?,
             // If we haven't been asked to use a schema registry, we have no way
             // to discover the writer's schema. That's ok; we'll just use the
             // reader's schema and hope it lines up.
@@ -1352,7 +1472,7 @@ impl Decoder {
                 buf: &mut self.buf1,
                 file_buf: &mut self.buf2,
             };
-            let mut dsr: GeneralDeserializer = GeneralDeserializer {
+            let dsr = GeneralDeserializer {
                 schema: resolved_schema.top_node(),
             };
             // Unwrap is OK: we assert in Decoder::new that this is non-none when envelope == dbz.
@@ -1392,7 +1512,7 @@ impl Decoder {
                 buf: &mut self.buf1,
                 is_top: true,
             };
-            let mut dsr: GeneralDeserializer = GeneralDeserializer {
+            let dsr = GeneralDeserializer {
                 schema: resolved_schema.top_node(),
             };
             dsr.deserialize(&mut bytes, dec)?;
@@ -1461,6 +1581,10 @@ fn build_schema(columns: &[(ColumnName, ColumnType)], include_transaction: bool)
             ScalarType::Jsonb => json!({
                 "type": "string",
                 "connect.name": "io.debezium.data.Json",
+            }),
+            ScalarType::Uuid => json!({
+                "type": "string",
+                "logicalType": "uuid",
             }),
             ScalarType::List(_t) => unimplemented!("list types"),
             ScalarType::Record { .. } => unimplemented!("record types"),
@@ -1558,7 +1682,7 @@ pub fn encode_debezium_transaction_unchecked(
         ("event_count".into(), event_count),
     ]);
     debug_assert!(avro.validate(DEBEZIUM_TRANSACTION_SCHEMA.top_node()));
-    avro::encode_unchecked(&avro, &DEBEZIUM_TRANSACTION_SCHEMA, &mut buf);
+    mz_avro::encode_unchecked(&avro, &DEBEZIUM_TRANSACTION_SCHEMA, &mut buf);
     buf
 }
 
@@ -1590,32 +1714,7 @@ impl fmt::Debug for Encoder {
 
 impl Encoder {
     pub fn new(desc: RelationDesc, include_transaction: bool) -> Self {
-        // Invent names for columns that don't have a name.
-        let mut columns: Vec<_> = desc
-            .into_iter()
-            .enumerate()
-            .map(|(i, (name, ty))| match name {
-                None => (ColumnName::from(format!("column{}", i + 1)), ty),
-                Some(name) => (name, ty),
-            })
-            .collect();
-
-        // Deduplicate names.
-        let mut seen = HashSet::new();
-        for (name, _ty) in &mut columns {
-            let stem_len = name.as_str().len();
-            let mut i = 1;
-            while seen.contains(name) {
-                name.as_mut_str().truncate(stem_len);
-                if name.as_str().ends_with(|c: char| c.is_ascii_digit()) {
-                    name.as_mut_str().push('_');
-                }
-                name.as_mut_str().push_str(&i.to_string());
-                i += 1;
-            }
-            seen.insert(name);
-        }
-
+        let columns = column_names_and_types(desc);
         let writer_schema = build_schema(&columns, include_transaction);
         Encoder {
             columns,
@@ -1650,7 +1749,7 @@ impl Encoder {
         encode_avro_header(&mut buf, schema_id);
         let avro = self.diff_pair_to_avro(diff_pair, transaction_id);
         debug_assert!(avro.validate(self.writer_schema.top_node()));
-        avro::encode_unchecked(&avro, &self.writer_schema, &mut buf);
+        mz_avro::encode_unchecked(&avro, &self.writer_schema, &mut buf);
         buf
     }
 
@@ -1666,7 +1765,7 @@ impl Encoder {
         encode_avro_header(&mut buf, schema_id);
         buf.write_i32::<NetworkEndian>(schema_id)
             .expect("writing to vec cannot fail");
-        avro::write_avro_datum(
+        mz_avro::write_avro_datum(
             &self.writer_schema,
             self.diff_pair_to_avro(diff_pair, transaction_id),
             &mut buf,
@@ -1741,6 +1840,36 @@ impl Encoder {
     }
 }
 
+/// Extracts deduplicated column names and types from a relation description.
+pub fn column_names_and_types(desc: RelationDesc) -> Vec<(ColumnName, ColumnType)> {
+    // Invent names for columns that don't have a name.
+    let mut columns: Vec<_> = desc
+        .into_iter()
+        .enumerate()
+        .map(|(i, (name, ty))| match name {
+            None => (ColumnName::from(format!("column{}", i + 1)), ty),
+            Some(name) => (name, ty),
+        })
+        .collect();
+
+    // Deduplicate names.
+    let mut seen = HashSet::new();
+    for (name, _ty) in &mut columns {
+        let stem_len = name.as_str().len();
+        let mut i = 1;
+        while seen.contains(name) {
+            name.as_mut_str().truncate(stem_len);
+            if name.as_str().ends_with(|c: char| c.is_ascii_digit()) {
+                name.as_mut_str().push('_');
+            }
+            name.as_mut_str().push_str(&i.to_string());
+            i += 1;
+        }
+        seen.insert(name);
+    }
+    columns
+}
+
 /// Encodes a sequence of `Datum` as Avro, using supplied column names and types.
 pub fn encode_datums_as_avro<'a, I>(datums: I, names_types: &[(ColumnName, ColumnType)]) -> Value
 where
@@ -1751,7 +1880,7 @@ where
         .zip_eq(datums)
         .map(|((name, typ), datum)| {
             let name = name.as_str().to_owned();
-            use avro::types::ToAvro;
+            use mz_avro::types::ToAvro;
             (name, TypedDatum::new(datum, typ.clone()).avro())
         })
         .collect();
@@ -1772,7 +1901,7 @@ impl<'a> TypedDatum<'a> {
     }
 }
 
-impl<'a> avro::types::ToAvro for TypedDatum<'a> {
+impl<'a> mz_avro::types::ToAvro for TypedDatum<'a> {
     fn avro(self) -> Value {
         let TypedDatum { datum, typ } = self;
         if typ.nullable && datum.is_null() {
@@ -1817,6 +1946,7 @@ impl<'a> avro::types::ToAvro for TypedDatum<'a> {
                 ScalarType::Bytes => Value::Bytes(Vec::from(datum.unwrap_bytes())),
                 ScalarType::String => Value::String(datum.unwrap_str().to_owned()),
                 ScalarType::Jsonb => Value::Json(JsonbRef::from_datum(datum).to_serde_json()),
+                ScalarType::Uuid => Value::Uuid(datum.unwrap_uuid()),
                 ScalarType::List(_t) => unimplemented!("list types"),
                 ScalarType::Record { .. } => unimplemented!("record types"),
             };
@@ -1834,7 +1964,7 @@ impl<'a> avro::types::ToAvro for TypedDatum<'a> {
 }
 
 struct SchemaCache {
-    cache: HashMap<i32, Option<Schema>>,
+    cache: HashMap<i32, Result<Schema, AvroError>>,
     ccsr_client: ccsr::Client,
 
     reader_fingerprint: SchemaFingerprint,
@@ -1854,24 +1984,388 @@ impl SchemaCache {
 
     /// Looks up the writer schema for ID. If the schema is literally identical
     /// to the reader schema, as determined by the reader schema fingerprint
-    /// that this schema cache was initialized with, returns None.
-    async fn get(&mut self, id: i32, reader_schema: &Schema) -> Result<Option<&Schema>> {
-        match self.cache.entry(id) {
-            Entry::Occupied(o) => Ok(o.into_mut().as_ref()),
+    /// that this schema cache was initialized with, returns the schema directly.
+    /// If not, performs schema resolution on the reader and writer and
+    /// returns the result.
+    async fn get(&mut self, id: i32, reader_schema: &Schema) -> anyhow::Result<&Schema> {
+        let entry = match self.cache.entry(id) {
+            Entry::Occupied(o) => o.into_mut(),
             Entry::Vacant(v) => {
-                // TODO(benesch): make this asynchronous, to avoid blocking the
-                // Timely thread on this network request.
-                let res = self.ccsr_client.get_schema_by_id(id).await?;
-                let schema = parse_schema(&res.raw)?;
-                if schema.fingerprint::<Sha256>().bytes == self.reader_fingerprint.bytes {
-                    Ok(v.insert(None).as_ref())
-                } else {
-                    // the writer schema differs from the reader schema,
-                    // so we need to perform schema resolution.
-                    let resolved = resolve_schemas(&schema, reader_schema)?;
-                    Ok(v.insert(Some(resolved)).as_ref())
-                }
+                // An issue with _fetching_ the schema should be returned
+                // immediately, and not cached, since it might get better on the
+                // next retry.
+                // TODO - some sort of exponential backoff or similar logic
+                let response = self.ccsr_client.get_schema_by_id(id).await?;
+                // Now, we've gotten some json back, so we want to cache it (regardless of whether it's a valid
+                // avro schema, it won't change).
+                //
+                // However, we can't just cache it directly, since resolving schemas takes significant CPU work,
+                // which  we don't want to repeat for every record. So, parse and resolve it, and cache the
+                // result (whether schema or error).
+                let rf = &self.reader_fingerprint.bytes;
+                let result = Schema::parse_str(&response.raw).and_then(|schema| {
+                    if &schema.fingerprint::<Sha256>().bytes == rf {
+                        Ok(schema)
+                    } else {
+                        // the writer schema differs from the reader schema,
+                        // so we need to perform schema resolution.
+                        let resolved = resolve_schemas(&schema, reader_schema)?;
+                        Ok(resolved)
+                    }
+                });
+                v.insert(result)
             }
+        };
+        entry.as_ref().map_err(|e| anyhow::Error::new(e.clone()))
+    }
+}
+
+/// Logic for the Avro representation of the CDCv2 protocol.
+pub mod cdc_v2 {
+
+    use repr::{ColumnName, ColumnType, Diff, RelationDesc, Row, RowPacker, ScalarType, Timestamp};
+    use serde_json::json;
+
+    use super::RowWrapper;
+
+    use avro_derive::AvroDecodeable;
+    use differential_dataflow::capture::{Message, Progress};
+    use mz_avro::schema::Schema;
+    use mz_avro::types::Value;
+    use mz_avro::{
+        define_unexpected,
+        error::{DecodeError, Error as AvroError},
+        ArrayAsVecDecoder, AvroDecode, AvroDecodeable, AvroDeserializer, AvroRead,
+        StatefulAvroDecodeable,
+    };
+    use std::{cell::RefCell, rc::Rc};
+
+    /// Collected state to encode update batches and progress statements.
+    #[derive(Debug)]
+    pub struct Encoder {
+        columns: Vec<(ColumnName, ColumnType)>,
+        schema: Schema,
+    }
+
+    impl Encoder {
+        /// Creates a new CDCv2 encoder from a relation description.
+        pub fn new(desc: RelationDesc) -> Self {
+            let columns = super::column_names_and_types(desc);
+            let row_schema = build_row_schema_json(&columns, "data");
+            let schema = build_schema(row_schema);
+            Self { columns, schema }
+        }
+
+        /// Encodes a batch of updates as an Avro value.
+        pub fn encode_updates(&self, updates: &[(Row, i64, i64)]) -> Value {
+            let mut enc_updates = Vec::new();
+            for (data, time, diff) in updates {
+                let enc_data = super::encode_datums_as_avro(data, &self.columns);
+                let enc_time = Value::Long(time.clone());
+                let enc_diff = Value::Long(diff.clone());
+                let mut enc_update = Vec::new();
+                enc_update.push(("data".to_string(), enc_data));
+                enc_update.push(("time".to_string(), enc_time));
+                enc_update.push(("diff".to_string(), enc_diff));
+                enc_updates.push(Value::Record(enc_update));
+            }
+            Value::Union {
+                index: 0,
+                inner: Box::new(Value::Array(enc_updates)),
+                n_variants: 2,
+                null_variant: None,
+            }
+        }
+
+        /// Encodes the contents of a progress statement as an Avro value.
+        pub fn encode_progress(
+            &self,
+            lower: &[i64],
+            upper: &[i64],
+            counts: &[(i64, i64)],
+        ) -> Value {
+            let enc_lower = Value::Array(lower.iter().cloned().map(Value::Long).collect());
+            let enc_upper = Value::Array(upper.iter().cloned().map(Value::Long).collect());
+            let enc_counts = Value::Array(
+                counts
+                    .iter()
+                    .map(|(time, count)| {
+                        Value::Record(vec![
+                            ("time".to_string(), Value::Long(time.clone())),
+                            ("count".to_string(), Value::Long(count.clone())),
+                        ])
+                    })
+                    .collect(),
+            );
+            let enc_progress = Value::Record(vec![
+                ("lower".to_string(), enc_lower),
+                ("upper".to_string(), enc_upper),
+                ("counts".to_string(), enc_counts),
+            ]);
+
+            Value::Union {
+                index: 1,
+                inner: Box::new(enc_progress),
+                n_variants: 2,
+                null_variant: None,
+            }
+        }
+    }
+
+    #[derive(AvroDecodeable)]
+    #[state_type(Rc<RefCell<RowPacker>>, Rc<RefCell<Vec<u8>>>)]
+    struct MyUpdate {
+        #[state_expr(self._STATE.0.clone(), self._STATE.1.clone())]
+        data: RowWrapper,
+        timestamp: Timestamp,
+        diff: Diff,
+    }
+    #[derive(AvroDecodeable)]
+    struct Count {
+        time: Timestamp,
+        count: usize,
+    }
+
+    fn make_counts_decoder() -> impl AvroDecode<Out = Vec<(Timestamp, usize)>> {
+        ArrayAsVecDecoder::new(|| {
+            <Count as AvroDecodeable>::new_decoder().map_decoder(|ct| Ok((ct.time, ct.count)))
+        })
+    }
+    #[derive(AvroDecodeable)]
+    struct MyProgress {
+        lower: Vec<Timestamp>,
+        upper: Vec<Timestamp>,
+        #[decoder_factory(make_counts_decoder)]
+        counts: Vec<(Timestamp, usize)>,
+    }
+
+    impl AvroDecode for Decoder {
+        type Out = Message<Row, Timestamp, Diff>;
+        fn union_branch<'a, R: AvroRead, D: AvroDeserializer>(
+            self,
+            idx: usize,
+            _n_variants: usize,
+            _null_variant: Option<usize>,
+            deserializer: D,
+            r: &'a mut R,
+        ) -> Result<Self::Out, AvroError> {
+            match idx {
+                0 => {
+                    let packer = Rc::new(RefCell::new(RowPacker::new()));
+                    let buf = Rc::new(RefCell::new(vec![]));
+                    let d = ArrayAsVecDecoder::new(|| {
+                        <MyUpdate as StatefulAvroDecodeable>::new_decoder((
+                            packer.clone(),
+                            buf.clone(),
+                        ))
+                        .map_decoder(|update| Ok((update.data.0, update.timestamp, update.diff)))
+                    });
+                    let updates = deserializer.deserialize(r, d)?;
+                    Ok(Message::Updates(updates))
+                }
+                1 => {
+                    let progress = deserializer
+                        .deserialize(r, <MyProgress as AvroDecodeable>::new_decoder())?;
+                    let progress = Progress {
+                        lower: progress.lower,
+                        upper: progress.upper,
+                        counts: progress.counts,
+                    };
+                    Ok(Message::Progress(progress))
+                }
+
+                other => Err(DecodeError::Custom(format!(
+                    "Unrecognized union variant in CDCv2 decoder: {}",
+                    other
+                ))
+                .into()),
+            }
+        }
+        define_unexpected! {
+            record, array, map, enum_variant, scalar, decimal, bytes, string, json, uuid, fixed
+        }
+    }
+
+    /// Collected state to decode update batches and progress statements.
+    #[derive(Debug)]
+    pub struct Decoder;
+
+    /// Builds the JSON for the row schema, which can be independently useful.
+    pub fn build_row_schema_json(
+        columns: &[(ColumnName, ColumnType)],
+        name: &str,
+    ) -> serde_json::value::Value {
+        let mut fields = Vec::new();
+        for (name, typ) in columns.iter() {
+            let mut field_type = match &typ.scalar_type {
+                ScalarType::Bool => json!("boolean"),
+                ScalarType::Int32 => json!("int"),
+                ScalarType::Int64 => json!("long"),
+                ScalarType::Float32 => json!("float"),
+                ScalarType::Float64 => json!("double"),
+                ScalarType::Decimal(p, s) => json!({
+                    "type": "bytes",
+                    "logicalType": "decimal",
+                    "precision": p,
+                    "scale": s,
+                }),
+                ScalarType::Date => json!({
+                    "type": "int",
+                    "logicalType": "date",
+                }),
+                ScalarType::Time => json!({
+                    "type": "long",
+                    "logicalType": "time-micros",
+                }),
+                ScalarType::Timestamp | ScalarType::TimestampTz => json!({
+                    "type": "long",
+                    "logicalType": "timestamp-micros"
+                }),
+                ScalarType::Interval => json!({
+                    "type": "fixed",
+                    "size": 12,
+                    "logicalType": "duration"
+                }),
+                ScalarType::Bytes => json!("bytes"),
+                ScalarType::String => json!("string"),
+                ScalarType::Jsonb => json!({
+                    "type": "string",
+                }),
+                ScalarType::Uuid => json!({
+                    "type": "string",
+                    "logicalType": "uuid",
+                }),
+                ScalarType::List(_t) => unimplemented!("list types"),
+                ScalarType::Record { .. } => unimplemented!("record types"),
+            };
+            if typ.nullable {
+                field_type = json!(["null", field_type]);
+            }
+            fields.push(json!({
+                "name": name,
+                "type": field_type,
+            }));
+        }
+        json!({
+            "type": "record",
+            "fields": fields,
+            "name": name
+        })
+    }
+
+    /// Construct the schema for the CDC V2 protocol.
+    pub fn build_schema(row_schema: serde_json::Value) -> Schema {
+        let updates_schema = json!({
+            "type": "array",
+            "items": {
+                "name" : "update",
+                "type" : "record",
+                "fields" : [
+                    {
+                        "name": "data",
+                        "type": row_schema,
+                    },
+                    {
+                        "name" : "time",
+                        "type" : "long",
+                    },
+                    {
+                        "name" : "diff",
+                        "type" : "long",
+                    },
+                ],
+            },
+        });
+
+        let progress_schema = json!({
+            "name" : "progress",
+            "type" : "record",
+            "fields" : [
+                {
+                    "name": "lower",
+                    "type": {
+                        "type": "array",
+                        "items": "long"
+                    }
+                },
+                {
+                    "name": "upper",
+                    "type": {
+                        "type": "array",
+                        "items": "long"
+                    }
+                },
+                {
+                    "name": "counts",
+                    "type": {
+                        "type": "array",
+                        "items": {
+                            "type": "record",
+                            "name": "counts",
+                            "fields": [
+                                {
+                                    "name": "time",
+                                    "type": "long",
+                                },
+                                {
+                                    "name": "count",
+                                    "type": "long",
+                                },
+                            ],
+                        }
+                    }
+                },
+            ],
+        });
+        let message_schema = json!([updates_schema, progress_schema,]);
+
+        Schema::parse(&message_schema).expect("schema constrution failed")
+    }
+
+    #[cfg(test)]
+    mod tests {
+
+        use super::*;
+        use mz_avro::AvroDeserializer;
+        use mz_avro::GeneralDeserializer;
+
+        #[test]
+        fn test_roundtrip() {
+            let desc = RelationDesc::empty()
+                .with_column("id", ScalarType::Int64.nullable(false))
+                .with_column("price", ScalarType::Float64.nullable(true));
+
+            let encoder = Encoder::new(desc.clone());
+            let row_schema =
+                build_row_schema_json(&crate::avro::column_names_and_types(desc), "data");
+            let schema = build_schema(row_schema);
+
+            let values = vec![
+                encoder.encode_updates(&[]),
+                encoder.encode_progress(&[0], &[3], &[]),
+                encoder.encode_progress(&[3], &[], &[]),
+            ];
+            use mz_avro::encode::encode_to_vec;;
+            let mut values: Vec<_> = values
+                .into_iter()
+                .map(|v| encode_to_vec(&v, &schema))
+                .collect();
+
+            let g = GeneralDeserializer {
+                schema: schema.top_node(),
+            };
+            assert!(matches!(
+                g.deserialize(&mut &values.remove(0)[..], Decoder).unwrap(),
+                Message::Updates(_)
+            ),);
+            assert!(matches!(
+                g.deserialize(&mut &values.remove(0)[..], Decoder).unwrap(),
+                Message::Progress(_)
+            ),);
+            assert!(matches!(
+                g.deserialize(&mut &values.remove(0)[..], Decoder).unwrap(),
+                Message::Progress(_)
+            ),);
         }
     }
 }
@@ -1884,7 +2378,7 @@ mod tests {
     use serde::Deserialize;
     use std::fs::File;
 
-    use avro::types::{DecimalValue, Value};
+    use mz_avro::types::{DecimalValue, Value};
     use repr::adt::decimal::Significand;
     use repr::{Datum, RelationDesc};
 
@@ -1899,7 +2393,7 @@ mod tests {
 
     #[test]
     #[ignore] // TODO(benesch): update tests for diff envelope.
-    fn test_schema_parsing() -> Result<()> {
+    fn test_schema_parsing() -> anyhow::Result<()> {
         let file = File::open("interchange/testdata/avro-schema.json")
             .context("opening test data file")?;
         let test_cases: Vec<TestCase> =
@@ -1924,7 +2418,7 @@ mod tests {
     /// Complete list of primitive types in test, also found in this
     /// documentation:
     /// https://avro.apache.org/docs/current/spec.html#schemas
-    fn test_diff_pair_to_avro_primitive_types() -> Result<()> {
+    fn test_diff_pair_to_avro_primitive_types() -> anyhow::Result<()> {
         // Data to be used later in assertions.
         let date = NaiveDate::from_ymd(2020, 1, 8);
         let date_time = NaiveDateTime::new(date, NaiveTime::from_hms(1, 1, 1));

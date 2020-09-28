@@ -15,10 +15,10 @@ use timely::dataflow::channels::pact::Exchange;
 use timely::dataflow::operators::generic::Operator;
 use timely::dataflow::{Scope, Stream};
 
-use dataflow_types::{AvroOcfSinkConnector, Timestamp};
-use expr::{Diff, GlobalId};
+use dataflow_types::AvroOcfSinkConnector;
+use expr::GlobalId;
 use interchange::avro::{DiffPair, Encoder};
-use repr::{RelationDesc, Row};
+use repr::{Diff, RelationDesc, Row, Timestamp};
 
 pub fn avro_ocf<G>(
     stream: &Stream<G, (Row, Timestamp, Diff)>,
@@ -34,7 +34,7 @@ pub fn avro_ocf<G>(
 
     let res = OpenOptions::new().append(true).open(&connector.path);
     let mut avro_writer = match res {
-        Ok(f) => Some(avro::Writer::new(schema.clone(), f)),
+        Ok(f) => Some(mz_avro::Writer::new(schema.clone(), f)),
         Err(e) => {
             error!("creating avro ocf file writer for sink failed: {}", e);
             None

@@ -17,8 +17,9 @@ use std::time::SystemTime;
 
 use expr::{GlobalId, ScalarExpr};
 use repr::RelationDesc;
+use uuid::Uuid;
 
-use crate::names::{DatabaseSpecifier, FullName, PartialName};
+use crate::names::{DatabaseSpecifier, FullName, PartialName, SchemaSpecifier};
 use crate::plan::PlanContext;
 
 /// A catalog keeps track of SQL objects available to the planner.
@@ -58,6 +59,9 @@ pub trait Catalog: fmt::Debug {
     /// topics. Perhaps we can remove this when #2915 is complete.
     fn nonce(&self) -> u64;
 
+    /// Returns a persistent UUID for the the catalog.
+    fn cluster_id(&self) -> Uuid;
+
     /// Returns the database to use if one is not explicitly specified.
     fn default_database(&self) -> &str;
 
@@ -83,7 +87,7 @@ pub trait Catalog: fmt::Debug {
         &self,
         database_name: Option<String>,
         schema_name: &str,
-    ) -> Result<DatabaseSpecifier, CatalogError>;
+    ) -> Result<(DatabaseSpecifier, SchemaSpecifier), CatalogError>;
 
     /// Resolves a partially-specified item name.
     ///
@@ -258,6 +262,10 @@ impl Catalog for DummyCatalog {
         0
     }
 
+    fn cluster_id(&self) -> Uuid {
+        Uuid::from_u128(0)
+    }
+
     fn default_database(&self) -> &str {
         "dummy"
     }
@@ -270,7 +278,7 @@ impl Catalog for DummyCatalog {
         &self,
         _: Option<String>,
         _: &str,
-    ) -> Result<DatabaseSpecifier, CatalogError> {
+    ) -> Result<(DatabaseSpecifier, SchemaSpecifier), CatalogError> {
         unimplemented!();
     }
 

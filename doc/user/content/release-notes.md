@@ -52,15 +52,63 @@ Wrap your release notes at the 80 character mark.
 - Support [`CREATE TABLE`](/sql/create-table), [`DROP TABLE`](/sql/drop-table),
   [`INSERT`](/sql/insert) and [`SHOW CREATE TABLE`](/sql/show-create-table).
 
-- Restore support for specifying multiple Kafka broker addresses in
-  [Kafka sources](/sql/create-source/avro-kafka/) {{% gh 3986 %}}.
+- Generate a persistent, unique identifier associated with each cluster. This
+  can be retrieved using the new [`mz_cluster_id`](/sql/functions#uuid-func) SQL
+  function.
+
+<span id="v0.4.3"></span>
+## v0.4.3
+
+* Permit adjusting the logical compaction window on a per-index basis via the
+  [`logical_compaction_window`](/sql/alter-index/#available-parameters)
+  parameter to the new [`ALTER INDEX`](/sql/alter-index) statement.
+
+* Add the [`uuid`](/sql/types/uuid) type to efficiently represent
+  universally-unique identifiers (UUIDs).
+
+* Report the `integer_datetime` parameter as `on` to ensure that [PgJDBC]
+  correctly decodes date and time values returned by prepared statements
+  {{% gh 4117 %}}.
+
+* Fix a bug in the query optimizer that could result in incorrect plans for
+  queries involving `UNION` operators and literals {{% gh 4195 %}}.
+
+<span id="v0.4.2"></span>
+## v0.4.2
+
+- Remove the `max_timestamp_batch_size` [`WITH`
+  option](/sql/create-source/avro-kafka/#with-options) from sources. Materialize
+  now automatically selects the optimal batch size. **Backwards-incompatible
+  change.**
+
+- Restore support for specifying multiple Kafka broker addresses in [Kafka
+  sources](/sql/create-source/avro-kafka/) {{% gh 3986 %}}.
 
   This fixes a regression introduced in v0.4.1.
 
-- Remove the `max_timestamp_batch_size`
-  [`WITH` option](https://materialize.io/docs/sql/create-source/avro-kafka/#with-options)
-  from sources. Materialize now automatically selects the optimal batch size.
-  **Backwards-incompatible change.**
+- Sort the output of [`SHOW COLUMNS`](/sql/show-columns/) by the order in which
+  the columns are defined in the targeted source, table, or view. Prior versions
+  did not guarantee any particular ordering.
+
+- Improve memory utilization:
+
+  - Reduce memory usage of [outer joins](/sql/join#join_type) when the join key
+    consists only of simple column equalities {{% gh 4047 %}}.
+
+  - Consume only a constant amount of memory when computing a
+    [`min` or `max` aggregation](/sql/functions/#aggregate-func)
+    on an [append-only source](/sql/create-source/avro-kafka/#append-only-envelope)
+    {{% gh 3994 %}}.
+
+- Always permit memory profiling via the `/prof` web UI, even if the
+  `MALLOC_CONF` environment variable is not configured to enable profiling
+  {% gh 4005 %}.
+
+- Handle large `VALUES` expressions. Previously, `VALUES` expressions with more
+  than several hundred entries would cause a stack overflow {{% gh 3995 %}}.
+
+- Add the `mz_records_per_dataflow_global` [metric](/ops/monitoring) to expose
+  the number of active records in each dataflow {{% gh 4036 %}}.
 
 <span id="v0.4.1"></span>
 ## v0.4.1
@@ -520,17 +568,6 @@ Wrap your release notes at the 80 character mark.
 
 - Improve CSV parsing speed by 5-6x.
 
-[`CREATE SOURCE`]: /sql/create-source
-[`SHOW CREATE SOURCE`]: /sql/show-create-source
-[`SHOW CREATE VIEW`]: /sql/show-create-view
-[`CREATE MATERIALIZED VIEW`]: /sql/create-materialized-view
-[`CREATE VIEW`]: /sql/create-view
-[`text`]: /sql/types/text
-[`date`]: /sql/types/date
-[`timestamp`]: /sql/types/timestamp
-[`timestamptz`]: /sql/types/timestamptz
-[`interval`]: /sql/types/interval
-
 <span id="v0.1.1"></span>
 ## v0.1.1
 
@@ -545,5 +582,17 @@ Wrap your release notes at the 80 character mark.
 <span id="v0.1.0"></span>
 ## v0.1.0
 
-- [What is Materialize?](/overview/what-is-materialize/)
-- [Architecture overview](/overview/architecture/)
+* [What is Materialize?](/overview/what-is-materialize/)
+* [Architecture overview](/overview/architecture/)
+
+[`CREATE MATERIALIZED VIEW`]: /sql/create-materialized-view
+[`CREATE SOURCE`]: /sql/create-source
+[`CREATE VIEW`]: /sql/create-view
+[`date`]: /sql/types/date
+[`interval`]: /sql/types/interval
+[`SHOW CREATE SOURCE`]: /sql/show-create-source
+[`SHOW CREATE VIEW`]: /sql/show-create-view
+[`text`]: /sql/types/text
+[`timestamp`]: /sql/types/timestamp
+[`timestamptz`]: /sql/types/timestamptz
+[PgJDBC]: https://jdbc.postgresql.org

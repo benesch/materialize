@@ -318,7 +318,9 @@ EXPLAIN PLAN FOR SELECT *  FROM t1, t3 WHERE t1.a = t3.a AND EXISTS (SELECT * FR
 
 %6 =
 | Join %4 %5 (= #0 #1)
-| | implementation = DeltaQuery %4 %5.(#0) | %5 %4.(#0)
+| | implementation = DeltaQuery
+| |   delta %4 %5.(#0)
+| |   delta %5 %4.(#0)
 | | demand = (#0)
 | Distinct group=(#0)
 | ArrangeBy (#0)
@@ -482,7 +484,9 @@ EXPLAIN PLAN FOR SELECT b IN (SELECT a FROM x) FROM y
 
 %3 =
 | Join %1 %2 (= #0 #1)
-| | implementation = DeltaQuery %1 %2.(#0) | %2 %1.(#0)
+| | implementation = DeltaQuery
+| |   delta %1 %2.(#0)
+| |   delta %2 %1.(#0)
 | | demand = (#0)
 | Distinct group=(#0)
 
@@ -533,7 +537,9 @@ EXPLAIN PLAN FOR SELECT b != ALL(SELECT a FROM x) FROM y
 
 %3 =
 | Join %1 %2 (= #0 #1)
-| | implementation = DeltaQuery %1 %2.(#0) | %2 %1.(#0)
+| | implementation = DeltaQuery
+| |   delta %1 %2.(#0)
+| |   delta %2 %1.(#0)
 | | demand = (#0)
 | Distinct group=(#0)
 
@@ -671,6 +677,15 @@ SELECT * FROM
     LATERAL (SELECT * FROM (SELECT col2) LEFT JOIN LATERAL (SELECT col2) ON true)
 ----
 1  1  1  1
+
+# Regression test for #4157, in which quantified expression simplification
+# failed to handle map expressions which depended upon a column introduced by
+# an earlier expression in the same map node.
+query I
+SELECT (SELECT 1 FROM ((SELECT col1) UNION (SELECT 1)))
+FROM (SELECT 1 col1)
+----
+1
 
 query error aggregate functions that refer exclusively to outer columns not yet supported
 SELECT (SELECT count(likes.likee)) FROM likes

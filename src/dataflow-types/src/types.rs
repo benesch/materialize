@@ -30,10 +30,7 @@ use expr::{GlobalId, OptimizedRelationExpr, PartitionId, RelationExpr, ScalarExp
 use interchange::avro::{self, DebeziumDeduplicationStrategy};
 use interchange::protobuf::{decode_descriptors, validate_descriptors};
 use kafka_util::KafkaAddrs;
-use repr::{ColumnName, ColumnType, RelationDesc, RelationType, Row, ScalarType};
-
-/// System-wide timestamp type.
-pub type Timestamp = u64;
+use repr::{ColumnName, ColumnType, RelationDesc, RelationType, Row, ScalarType, Timestamp};
 
 /// The response from a `Peek`.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -68,7 +65,7 @@ pub struct Update {
 pub struct BuildDesc {
     pub id: GlobalId,
     pub relation_expr: OptimizedRelationExpr,
-    /// If a building a view, the types of columns of the built view
+    /// If building a view, the types of columns of the built view
     /// None if building an index
     pub typ: Option<RelationType>,
 }

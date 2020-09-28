@@ -18,18 +18,18 @@ use log::error;
 use notify::{RecursiveMode, Watcher};
 use timely::scheduling::{Activator, SyncActivator};
 
-use avro::types::Value;
-use avro::{AvroRead, Schema, Skip};
 use dataflow_types::{
     AvroOcfEncoding, Consistency, DataEncoding, ExternalSourceConnector, MzOffset,
 };
 use expr::{PartitionId, SourceInstanceId};
+use mz_avro::types::Value;
+use mz_avro::{AvroRead, Schema, Skip};
 
 use crate::server::{
     TimestampDataUpdate, TimestampDataUpdates, TimestampMetadataUpdate, TimestampMetadataUpdates,
 };
 use crate::source::{
-    ConsistencyInfo, PartitionMetrics, SourceConstructor, SourceInfo, SourceMessage,
+    ConsistencyInfo, NextMessage, PartitionMetrics, SourceConstructor, SourceInfo, SourceMessage,
 };
 
 /// Contains all information necessary to ingest data from file sources (either
@@ -89,7 +89,7 @@ impl SourceConstructor<Value> for FileSourceInfo<Value> {
                     ),
                 };
                 let reader_schema = Schema::parse_str(reader_schema).unwrap();
-                let ctor = { move |file| avro::Reader::with_schema(&reader_schema, file) };
+                let ctor = { move |file| mz_avro::Reader::with_schema(&reader_schema, file) };
                 let tail = if oc.tail {
                     FileReadStyle::TailFollowFd
                 } else {
@@ -250,9 +250,9 @@ impl<Out> SourceInfo<Out> for FileSourceInfo<Out> {
         &mut self,
         _consistency_info: &mut ConsistencyInfo,
         _activator: &Activator,
-    ) -> Result<Option<SourceMessage<Out>>, anyhow::Error> {
+    ) -> Result<NextMessage<Out>, anyhow::Error> {
         if let Some(message) = self.buffer.take() {
-            Ok(Some(message))
+            Ok(NextMessage::Ready(message))
         } else {
             match self.receiver_stream.try_recv() {
                 Ok(Ok(record)) => {
@@ -263,15 +263,14 @@ impl<Out> SourceInfo<Out> for FileSourceInfo<Out> {
                         key: None,
                         payload: Some(record),
                     };
-                    Ok(Some(message))
+                    Ok(NextMessage::Ready(message))
                 }
                 Ok(Err(e)) => {
                     error!("Failed to read file for {}. Error: {}.", self.id, e);
                     Err(e)
                 }
-                Err(TryRecvError::Empty) => Ok(None),
-                //TODO(ncrooks): add mechanism to return SourceStatus::Done
-                Err(TryRecvError::Disconnected) => Ok(None),
+                Err(TryRecvError::Empty) => Ok(NextMessage::Pending),
+                Err(TryRecvError::Disconnected) => Ok(NextMessage::Finished),
             }
         }
     }

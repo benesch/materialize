@@ -17,11 +17,11 @@
 //! must accumulate to the same value as would an un-compacted trace.
 
 use std::cmp;
-use std::collections::{BTreeMap, HashMap};
-use std::convert::TryInto;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::convert::{TryFrom, TryInto};
 use std::iter;
 use std::os::unix::ffi::OsStringExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, SystemTime};
 
@@ -38,14 +38,15 @@ use dataflow::{PersistenceMessage, SequencedCommand, WorkerFeedback, WorkerFeedb
 use dataflow_types::logging::LoggingConfig;
 use dataflow_types::{
     AvroOcfSinkConnector, DataflowDesc, IndexDesc, KafkaSinkConnector, PeekResponse, SinkConnector,
-    SourceConnector, TailSinkConnector, Timestamp, TimestampSourceUpdate, Update,
+    SourceConnector, TailSinkConnector, TimestampSourceUpdate, Update,
 };
 use expr::{
     GlobalId, Id, IdHumanizer, NullaryFunc, OptimizedRelationExpr, RelationExpr, RowSetFinishing,
     ScalarExpr, SourceInstanceId,
 };
+use ore::collections::CollectionExt;
 use ore::thread::JoinHandleExt;
-use repr::{ColumnName, Datum, RelationDesc, RelationType, Row, RowPacker};
+use repr::{ColumnName, Datum, RelationDesc, RelationType, Row, RowPacker, Timestamp};
 use sql::ast::display::AstDisplay;
 use sql::ast::{
     CreateIndexStatement, CreateTableStatement, DropObjectsStatement, ExplainOptions, ExplainStage,
@@ -53,15 +54,21 @@ use sql::ast::{
 };
 use sql::catalog::Catalog as _;
 use sql::names::{DatabaseSpecifier, FullName};
-use sql::plan::{MutationKind, Params, PeekWhen, Plan, PlanContext};
+use sql::plan::{
+    AlterIndexLogicalCompactionWindow, LogicalCompactionWindow, MutationKind, Params, PeekWhen,
+    Plan, PlanContext,
+};
 use transform::Optimizer;
 
 use self::arrangement_state::{ArrangementFrontiers, Frontiers};
 use crate::catalog::builtin::{
-    BUILTINS, MZ_AVRO_OCF_SINKS, MZ_CATALOG_NAMES, MZ_COLUMNS, MZ_DATABASES, MZ_KAFKA_SINKS,
-    MZ_SCHEMAS, MZ_VIEW_FOREIGN_KEYS, MZ_VIEW_KEYS,
+    BUILTINS, MZ_AVRO_OCF_SINKS, MZ_CATALOG_NAMES, MZ_COLUMNS, MZ_DATABASES, MZ_INDEXES,
+    MZ_KAFKA_SINKS, MZ_SCHEMAS, MZ_SINKS, MZ_SOURCES, MZ_TABLES, MZ_VIEWS, MZ_VIEW_FOREIGN_KEYS,
+    MZ_VIEW_KEYS,
 };
-use crate::catalog::{self, Catalog, CatalogItem, SinkConnectorState};
+use crate::catalog::{
+    self, Catalog, CatalogItem, Index, SinkConnectorState, AMBIENT_DATABASE_ID, AMBIENT_SCHEMA_ID,
+};
 use crate::persistence::{PersistenceConfig, Persister};
 use crate::session::{PreparedStatement, Session};
 use crate::timestamp::{TimestampConfig, TimestampMessage, Timestamper};
@@ -140,6 +147,7 @@ where
     // Channel to communicate source status updates and shutdown notifications to the persister
     // thread.
     persistence_tx: Option<PersistenceSender>,
+    persistence_path: Option<PathBuf>,
     /// The last timestamp we assigned to a read.
     read_lower_bound: Timestamp,
     /// The timestamp that all local inputs have been advanced up to.
@@ -183,16 +191,9 @@ where
             experimental_mode: Some(config.experimental_mode),
             enable_logging: config.logging_granularity.is_some(),
         })?;
-        let logical_compaction_window_ms = config.logical_compaction_window.map(|d| {
-            let millis = d.as_millis();
-            if millis > Timestamp::max_value() as u128 {
-                Timestamp::max_value()
-            } else if millis < Timestamp::min_value() as u128 {
-                Timestamp::min_value()
-            } else {
-                millis as Timestamp
-            }
-        });
+        let logical_compaction_window_ms = config
+            .logical_compaction_window
+            .map(duration_to_timestamp_millis);
         let (tx, rx) = config.switchboard.mpsc_limited(config.num_timely_workers);
         broadcast(&mut broadcast_tx, SequencedCommand::EnableFeedback(tx));
 
@@ -209,18 +210,22 @@ where
             );
         }
 
-        let (persister, persistence_tx) = if let Some(persistence_config) = config.persistence {
+        let (persister, persistence_tx, persistence_path) = if let Some(persistence_config) =
+            config.persistence
+        {
             let (persistence_tx, persistence_rx) = config.switchboard.mpsc();
             broadcast(
                 &mut broadcast_tx,
                 SequencedCommand::EnablePersistence(persistence_tx.clone()),
             );
+            let path = persistence_config.path.clone();
             (
                 Some(Persister::new(persistence_rx, persistence_config)),
                 Some(block_on(persistence_tx.connect()).expect("failed to connect persistence tx")),
+                Some(path),
             )
         } else {
-            (None, None)
+            (None, None, None)
         };
 
         let mut coord = Self {
@@ -242,6 +247,7 @@ where
             feedback_rx: Some(rx),
             persister,
             persistence_tx,
+            persistence_path,
             closed_up_to: 1,
             read_lower_bound: 1,
             last_op_was_read: false,
@@ -254,46 +260,17 @@ where
             .map(|entry| (entry.id(), entry.name().clone(), entry.item().clone()))
             .collect();
 
-        for (id, name, item) in &catalog_entries {
+        // Sources and indexes may be depended upon by other catalog items,
+        // insert them first.
+        for (id, _, item) in &catalog_entries {
             match item {
-                CatalogItem::Table(_) | CatalogItem::View(_) => (),
                 //currently catalog item rebuild assumes that sinks and
                 //indexes are always built individually and does not store information
                 //about how it was built. If we start building multiple sinks and/or indexes
                 //using a single dataflow, we have to make sure the rebuild process re-runs
                 //the same multiple-build dataflow.
                 CatalogItem::Source(source) => {
-                    // See if we have any previously persisted data that we need to reread.
-                    // Only do this if persistence is enabled for Materialize.
-                    if let Some(persister) = &coord.persister {
-                        let connector = crate::persistence::augment_connector(
-                            source.connector.clone(),
-                            persister.config.path.clone(),
-                            *id,
-                        )?;
-
-                        // If we got back a new connector, we need to take some
-                        // additional action.
-                        if let Some(connector) = connector {
-                            coord.enable_source_connector_persistence(*id, connector);
-                        }
-                    }
-                }
-                CatalogItem::Sink(sink) => {
-                    let builder = match &sink.connector {
-                        SinkConnectorState::Pending(builder) => builder,
-                        SinkConnectorState::Ready(_) => {
-                            panic!("sink already initialized during catalog boot")
-                        }
-                    };
-                    let connector = block_on(sink_connector::build(
-                        builder.clone(),
-                        sink.with_snapshot,
-                        coord.determine_frontier(sink.as_of, sink.from)?,
-                        *id,
-                    ))
-                    .with_context(|| format!("recreating sink {}", name))?;
-                    coord.handle_sink_connector_ready(*id, connector);
+                    coord.maybe_begin_persistence(*id, &source.connector);
                 }
                 CatalogItem::Index(_) => {
                     if BUILTINS.logs().any(|log| log.index_id == *id) {
@@ -313,21 +290,64 @@ where
                         coord.ship_dataflow(coord.build_index_dataflow(*id));
                     }
                 }
+                _ => (), // Handled in next loop.
             }
         }
 
+        for (id, name, item) in &catalog_entries {
+            match item {
+                CatalogItem::Table(_) | CatalogItem::View(_) => (),
+                CatalogItem::Sink(sink) => {
+                    let builder = match &sink.connector {
+                        SinkConnectorState::Pending(builder) => builder,
+                        SinkConnectorState::Ready(_) => {
+                            panic!("sink already initialized during catalog boot")
+                        }
+                    };
+                    let connector = block_on(sink_connector::build(
+                        builder.clone(),
+                        sink.with_snapshot,
+                        coord.determine_frontier(sink.as_of, sink.from)?,
+                        *id,
+                    ))
+                    .with_context(|| format!("recreating sink {}", name))?;
+                    coord.handle_sink_connector_ready(*id, connector);
+                }
+                _ => (), // Handled in prior loop.
+            }
+        }
+
+        let mut tables_to_report = HashSet::new();
+        let mut sources_to_report = HashSet::new();
+        let mut views_to_report = HashSet::new();
+        let mut sinks_to_report = HashSet::new();
         for (id, name, item) in catalog_entries {
             // Mirror each recovered catalog entry.
             coord.report_catalog_update(id, name.to_string(), 1);
 
             if let Ok(desc) = item.desc(&name) {
-                coord.update_mz_columns_catalog_view(desc, &name.to_string(), id, 1);
+                coord.report_column_updates(desc, id, 1);
+            }
+            match item {
+                CatalogItem::Index(index) => coord.report_index_update(id, &index, 1),
+                CatalogItem::Table(_) => {
+                    tables_to_report.insert(id);
+                }
+                CatalogItem::Source(_) => {
+                    sources_to_report.insert(id);
+                }
+                CatalogItem::View(_) => {
+                    views_to_report.insert(id);
+                }
+                CatalogItem::Sink(_) => {
+                    sinks_to_report.insert(id);
+                }
             }
         }
 
         // Insert initial named objects into system tables.
-        // Databases and named schemas.
-        let dbs: Vec<(String, i64, Vec<(String, i64)>)> = coord
+        coord.report_database_update(AMBIENT_DATABASE_ID, "AMBIENT", 1);
+        let dbs: Vec<(String, i64, Vec<(String, i64, Vec<(String, GlobalId)>)>)> = coord
             .catalog
             .databases()
             .map(|(name, database)| {
@@ -337,35 +357,77 @@ where
                     database
                         .schemas
                         .iter()
-                        .map(|(schema_name, schema)| (schema_name.to_string(), schema.id))
+                        .map(|(schema_name, schema)| {
+                            (
+                                schema_name.to_string(),
+                                schema.id,
+                                schema
+                                    .items
+                                    .iter()
+                                    .map(|(name, id)| (name.clone(), *id))
+                                    .collect(),
+                            )
+                        })
                         .collect(),
                 )
             })
             .collect();
         for (database_name, database_id, schemas) in dbs {
-            coord.update_mz_databases_catalog_view(database_id, &database_name, 1);
-            for (schema_name, schema_id) in schemas {
-                coord.update_mz_schemas_catalog_view(
-                    &database_id.to_string(),
-                    schema_id,
-                    &schema_name,
-                    "USER",
-                    1,
-                );
+            coord.report_database_update(database_id, &database_name, 1);
+
+            for (schema_name, schema_id, items) in schemas {
+                coord.report_schema_update(database_id, schema_id, &schema_name, "USER", 1);
+
+                for (item_name, item_id) in items {
+                    if tables_to_report.remove(&item_id) {
+                        coord.report_table_update(&item_id, schema_id, &item_name, 1);
+                    } else if sources_to_report.remove(&item_id) {
+                        coord.report_source_update(&item_id, schema_id, &item_name, 1);
+                    } else if views_to_report.remove(&item_id) {
+                        coord.report_view_update(&item_id, schema_id, &item_name, 1);
+                    } else if sinks_to_report.remove(&item_id) {
+                        coord.report_sink_update(&item_id, schema_id, &item_name, 1);
+                    }
+                }
             }
         }
-        // Ambient schemas.
-        let ambient_schemas: Vec<(String, i64)> = coord
+        let ambient_schemas: Vec<(String, i64, Vec<(String, GlobalId)>)> = coord
             .catalog
             .ambient_schemas()
-            .map(|(schema_name, schema)| (schema_name.to_string(), schema.id))
+            .map(|(schema_name, schema)| {
+                (
+                    schema_name.to_string(),
+                    schema.id,
+                    schema
+                        .items
+                        .iter()
+                        .map(|(name, id)| (name.clone(), *id))
+                        .collect(),
+                )
+            })
             .collect();
-        for (schema_name, schema_id) in ambient_schemas {
-            coord.update_mz_schemas_catalog_view("AMBIENT", schema_id, &schema_name, "SYSTEM", 1);
+        for (schema_name, schema_id, items) in ambient_schemas {
+            coord.report_schema_update(AMBIENT_DATABASE_ID, schema_id, &schema_name, "SYSTEM", 1);
+
+            for (item_name, item_id) in items {
+                if tables_to_report.remove(&item_id) {
+                    coord.report_table_update(&item_id, schema_id, &item_name, 1);
+                } else if sources_to_report.remove(&item_id) {
+                    coord.report_source_update(&item_id, schema_id, &item_name, 1);
+                } else if views_to_report.remove(&item_id) {
+                    coord.report_view_update(&item_id, schema_id, &item_name, 1);
+                } else if sinks_to_report.remove(&item_id) {
+                    coord.report_sink_update(&item_id, schema_id, &item_name, 1);
+                }
+            }
         }
-        // The ambient "mz_temp" schema has a single GlobalId: -1.
-        coord.update_mz_schemas_catalog_view("AMBIENT", -1, "mz_temp", "system", 1);
-        // Todo@jldlaughlin: insert rest of named objects!
+        coord.report_schema_update(
+            AMBIENT_DATABASE_ID,
+            AMBIENT_SCHEMA_ID,
+            "mz_temp",
+            "system",
+            1,
+        );
 
         // Announce primary and foreign key relationships.
         if coord.logging_granularity.is_some() {
@@ -724,7 +786,7 @@ where
                 // the case of a constant collection, this compaction is actively
                 // harmful. We should reconsider compaction policy with an eye
                 // towards minimizing unexpected screw-ups.
-                if let Some(compaction_latency_ms) = index_state.compaction_latency_ms {
+                if let Some(compaction_window_ms) = index_state.compaction_window_ms {
                     // Decline to compact complete collections. This would have the
                     // effect of making the collection unusable. Instead, we would
                     // prefer to compact collections only when we believe it would
@@ -734,9 +796,9 @@ where
                         let mut compaction_frontier = Antichain::new();
                         for time in index_state.upper.frontier().iter() {
                             compaction_frontier.insert(
-                                compaction_latency_ms
-                                    * (time.saturating_sub(compaction_latency_ms)
-                                        / compaction_latency_ms),
+                                compaction_window_ms
+                                    * (time.saturating_sub(compaction_window_ms)
+                                        / compaction_window_ms),
                             );
                         }
                         if index_state.since != compaction_frontier {
@@ -916,11 +978,6 @@ where
         self.ship_dataflow(self.build_sink_dataflow(name.to_string(), id, sink.from, connector))
     }
 
-    fn report_catalog_update(&mut self, id: GlobalId, name: String, diff: isize) {
-        let row = Row::pack(&[Datum::String(&id.to_string()), Datum::String(&name)]);
-        self.update_catalog_view(MZ_CATALOG_NAMES.id, iter::once((row, diff)));
-    }
-
     /// Insert a single row into a given catalog view.
     fn update_catalog_view<I>(&mut self, index_id: GlobalId, updates: I)
     where
@@ -944,39 +1001,24 @@ where
         );
     }
 
-    /// Inserts a single row into the MZ_DATABASES catalog view, with diff `diff`.
-    ///
-    /// # Arguments
-    ///
-    /// * `global_id`:   Global id of the database.
-    /// * `name`:        Name of the database.
-    /// * `diff`:        The number of updates to perform. A positive number indicates an addition
-    ///                  of the row, a negative number indicates a subtraction.
-    fn update_mz_databases_catalog_view(&mut self, global_id: i64, name: &str, diff: isize) {
+    fn report_catalog_update(&mut self, id: GlobalId, name: String, diff: isize) {
+        let row = Row::pack(&[Datum::String(&id.to_string()), Datum::String(&name)]);
+        self.update_catalog_view(MZ_CATALOG_NAMES.id, iter::once((row, diff)));
+    }
+
+    fn report_database_update(&mut self, database_id: i64, name: &str, diff: isize) {
         self.update_catalog_view(
             MZ_DATABASES.id,
             iter::once((
-                Row::pack(&[Datum::String(&global_id.to_string()), Datum::String(&name)]),
+                Row::pack(&[Datum::Int64(database_id), Datum::String(&name)]),
                 diff,
             )),
         )
     }
 
-    /// Inserts a single row into the MZ_SCHEMAS catalog view, with diff `diff`.
-    ///
-    /// # Arguments
-    ///
-    /// * `database_id`: String representation of the database in which the schema is present.
-    ///                  Possible values are an actual database's global id, or "AMBIENT".
-    /// * `schema_id`:   Id of the schema.
-    /// * `schema_name`: Name of the schema.
-    /// * `typ`:         There are two types of schemas: "SYSTEM" and "USER". This classification
-    ///                  impacts which schemas can be updated or deleted.
-    /// * `diff`:        The number of updates to perform. A positive number indicates an addition
-    ///                  of the row, a negative number indicates a subtraction.
-    fn update_mz_schemas_catalog_view(
+    fn report_schema_update(
         &mut self,
-        database_id: &str,
+        database_id: i64,
         schema_id: i64,
         schema_name: &str,
         typ: &str,
@@ -986,8 +1028,8 @@ where
             MZ_SCHEMAS.id,
             iter::once((
                 Row::pack(&[
-                    Datum::String(&schema_id.to_string()),
-                    Datum::String(database_id),
+                    Datum::Int64(database_id),
+                    Datum::Int64(schema_id),
                     Datum::String(schema_name),
                     Datum::String(typ),
                 ]),
@@ -996,29 +1038,12 @@ where
         )
     }
 
-    /// Inserts a single row into the MZ_COLUMNS catalog view, with diff `diff`.
-    /// The MZ_COLUMNS catalog view contains a row for each column in every Table, Source, and View.
-    ///
-    /// # Arguments
-    ///
-    /// * `desc`:        RelationDesc of the Table, Source, or View.
-    /// * `full_name`:   Full, qualified name of the Table, Source, or View (e.g., "materialize.public.table").
-    /// * `global_id`:   GlobalId of the Table, Source, or View.
-    /// * `diff`:        The number of updates to perform. A positive number indicates an addition
-    ///                  of the row, a negative number indicates a subtraction.
-    fn update_mz_columns_catalog_view(
-        &mut self,
-        desc: &RelationDesc,
-        full_name: &str,
-        global_id: GlobalId,
-        diff: isize,
-    ) {
+    fn report_column_updates(&mut self, desc: &RelationDesc, global_id: GlobalId, diff: isize) {
         for (i, (column_name, column_type)) in desc.iter().enumerate() {
             self.update_catalog_view(
                 MZ_COLUMNS.id,
                 iter::once((
                     Row::pack(&[
-                        Datum::String(&full_name),
                         Datum::String(&global_id.to_string()),
                         Datum::Int64(i as i64),
                         Datum::String(
@@ -1033,6 +1058,152 @@ where
                 )),
             )
         }
+    }
+
+    fn report_index_update(&mut self, global_id: GlobalId, index: &Index, diff: isize) {
+        self.report_index_update_inner(
+            global_id,
+            index,
+            index
+                .keys
+                .iter()
+                .map(|key| {
+                    key.typ(self.catalog.get_by_id(&index.on).desc().unwrap().typ())
+                        .nullable
+                })
+                .collect(),
+            diff,
+        )
+    }
+
+    // When updating the mz_indexes system table after dropping an index, it may no longer be possible
+    // to generate the 'nullable' information for that index. This function allows callers to bypass
+    // that computation and provide their own value, instead.
+    fn report_index_update_inner(
+        &mut self,
+        global_id: GlobalId,
+        index: &Index,
+        nullable: Vec<bool>,
+        diff: isize,
+    ) {
+        let key_sqls = match sql::parse::parse(index.create_sql.to_owned())
+            .expect("create_sql cannot be invalid")
+            .into_element()
+        {
+            Statement::CreateIndex(CreateIndexStatement { key_parts, .. }) => key_parts.unwrap(),
+            _ => unreachable!(),
+        };
+        for (i, key) in index.keys.iter().enumerate() {
+            let nullable = *nullable
+                .get(i)
+                .expect("missing nullability information for index key");
+            let seq_in_index = i64::try_from(i + 1).expect("invalid index sequence number");
+            let key_sql = key_sqls
+                .get(i)
+                .expect("missing sql information for index key")
+                .to_string();
+            let (field_number, expression) = match key {
+                ScalarExpr::Column(col) => (
+                    Datum::Int64(i64::try_from(*col).expect("invalid index column number")),
+                    Datum::Null,
+                ),
+                _ => (Datum::Null, Datum::String(&key_sql)),
+            };
+            self.update_catalog_view(
+                MZ_INDEXES.id,
+                iter::once((
+                    Row::pack(&[
+                        Datum::String(&global_id.to_string()),
+                        Datum::String(&index.on.to_string()),
+                        field_number,
+                        expression,
+                        Datum::from(nullable),
+                        Datum::Int64(seq_in_index),
+                    ]),
+                    diff,
+                )),
+            )
+        }
+    }
+
+    fn report_table_update(
+        &mut self,
+        global_id: &GlobalId,
+        schema_id: i64,
+        name: &str,
+        diff: isize,
+    ) {
+        self.update_catalog_view(
+            MZ_TABLES.id,
+            iter::once((
+                Row::pack(&[
+                    Datum::String(&global_id.to_string()),
+                    Datum::Int64(schema_id),
+                    Datum::String(name),
+                ]),
+                diff,
+            )),
+        )
+    }
+
+    fn report_source_update(
+        &mut self,
+        global_id: &GlobalId,
+        schema_id: i64,
+        name: &str,
+        diff: isize,
+    ) {
+        self.update_catalog_view(
+            MZ_SOURCES.id,
+            iter::once((
+                Row::pack(&[
+                    Datum::String(&global_id.to_string()),
+                    Datum::Int64(schema_id),
+                    Datum::String(name),
+                ]),
+                diff,
+            )),
+        )
+    }
+
+    fn report_view_update(
+        &mut self,
+        global_id: &GlobalId,
+        schema_id: i64,
+        name: &str,
+        diff: isize,
+    ) {
+        self.update_catalog_view(
+            MZ_VIEWS.id,
+            iter::once((
+                Row::pack(&[
+                    Datum::String(&global_id.to_string()),
+                    Datum::Int64(schema_id),
+                    Datum::String(name),
+                ]),
+                diff,
+            )),
+        )
+    }
+
+    fn report_sink_update(
+        &mut self,
+        global_id: &GlobalId,
+        schema_id: i64,
+        name: &str,
+        diff: isize,
+    ) {
+        self.update_catalog_view(
+            MZ_SINKS.id,
+            iter::once((
+                Row::pack(&[
+                    Datum::String(&global_id.to_string()),
+                    Datum::Int64(schema_id),
+                    Datum::String(name),
+                ]),
+                diff,
+            )),
+        )
     }
 
     fn sequence_plan(
@@ -1221,6 +1392,11 @@ where
                 self.sequence_alter_item_rename(id, to_name, object_type),
                 session,
             ),
+
+            Plan::AlterIndexLogicalCompactionWindow(alter_index) => tx.send(
+                self.sequence_alter_index_logical_compaction_window(alter_index),
+                session,
+            ),
         }
     }
 
@@ -1340,7 +1516,7 @@ where
                     self.ship_dataflow(self.build_index_dataflow(index_id));
                 }
 
-                self.enable_source_connector_persistence(source_id, source.connector);
+                self.maybe_begin_persistence(source_id, &source.connector);
                 Ok(ExecuteResponse::CreatedSource { existed: false })
             }
             Err(_) if if_not_exists => Ok(ExecuteResponse::CreatedSource { existed: true }),
@@ -1461,7 +1637,6 @@ where
             index_name.item += "_primary_idx";
             let index =
                 auto_generate_primary_idx(index_name.item.clone(), name, view_id, &view.desc);
-
             let index_id = self.catalog.allocate_id()?;
             ops.push(catalog::Op::CreateItem {
                 id: index_id,
@@ -2062,6 +2237,36 @@ where
         }
     }
 
+    fn sequence_alter_index_logical_compaction_window(
+        &mut self,
+        alter_index: Option<AlterIndexLogicalCompactionWindow>,
+    ) -> Result<ExecuteResponse, anyhow::Error> {
+        let (index, logical_compaction_window) = match alter_index {
+            Some(AlterIndexLogicalCompactionWindow {
+                index,
+                logical_compaction_window,
+            }) => (index, logical_compaction_window),
+            // None is generated by `IF EXISTS` or if `logical_compaction_window`
+            // was not found in ALTER INDEX ... RESET
+            None => return Ok(ExecuteResponse::AlteredIndexLogicalCompaction),
+        };
+
+        let logical_compaction_window = match logical_compaction_window {
+            LogicalCompactionWindow::Off => None,
+            LogicalCompactionWindow::Default => self.logical_compaction_window_ms,
+            LogicalCompactionWindow::Custom(window) => Some(duration_to_timestamp_millis(window)),
+        };
+
+        if let Some(index) = self.indexes.get_mut(&index) {
+            index.set_compaction_window_ms(logical_compaction_window);
+            Ok(ExecuteResponse::AlteredIndexLogicalCompaction)
+        } else {
+            // This can potentially happen if tries to delete the index and also
+            // alter the index concurrently
+            bail!("index {} not found", index.to_string())
+        }
+    }
+
     fn catalog_transact(&mut self, ops: Vec<catalog::Op>) -> Result<(), anyhow::Error> {
         let mut sources_to_drop = vec![];
         let mut sinks_to_drop = vec![];
@@ -2071,22 +2276,21 @@ where
         for status in &statuses {
             match status {
                 catalog::OpStatus::CreatedDatabase { name, id } => {
-                    self.update_mz_databases_catalog_view(*id, name, 1);
+                    self.report_database_update(*id, name, 1);
                 }
                 catalog::OpStatus::CreatedSchema {
                     database_id,
                     schema_id,
                     schema_name,
                 } => {
-                    self.update_mz_schemas_catalog_view(
-                        &database_id.to_string(),
-                        *schema_id,
-                        schema_name,
-                        "USER",
-                        1,
-                    );
+                    self.report_schema_update(*database_id, *schema_id, schema_name, "USER", 1);
                 }
-                catalog::OpStatus::CreatedItem { id, name, item } => {
+                catalog::OpStatus::CreatedItem {
+                    schema_id,
+                    id,
+                    name,
+                    item,
+                } => {
                     self.report_catalog_update(
                         *id,
                         self.catalog.humanize_id(expr::Id::Global(*id)).unwrap(),
@@ -2094,37 +2298,116 @@ where
                     );
 
                     if let Ok(desc) = item.desc(&name) {
-                        self.update_mz_columns_catalog_view(desc, &name.to_string(), *id, 1);
+                        self.report_column_updates(desc, *id, 1);
+                    }
+                    match item {
+                        CatalogItem::Index(index) => self.report_index_update(*id, index, 1),
+                        CatalogItem::Table(_) => {
+                            self.report_table_update(id, *schema_id, &name.item, 1)
+                        }
+                        CatalogItem::Source(_) => {
+                            self.report_source_update(id, *schema_id, &name.item, 1);
+                        }
+                        CatalogItem::View(_) => {
+                            self.report_view_update(id, *schema_id, &name.item, 1);
+                        }
+                        CatalogItem::Sink(_) => {
+                            self.report_sink_update(id, *schema_id, &name.item, 1);
+                        }
+                    }
+                }
+                catalog::OpStatus::UpdatedItem {
+                    schema_id,
+                    id,
+                    from_name,
+                    to_name,
+                    item,
+                } => {
+                    // Remove old name from mz_catalog_names.
+                    self.report_catalog_update(*id, from_name.to_string(), -1);
+
+                    // Add new name to mz_catalog_names.
+                    self.report_catalog_update(*id, to_name.to_string(), 1);
+
+                    // Remove old name and add new name to relevant mz system tables.
+                    match item {
+                        CatalogItem::Source(_) => {
+                            self.report_source_update(id, *schema_id, &from_name.item, -1);
+                            self.report_source_update(id, *schema_id, &to_name.item, 1);
+                        }
+                        CatalogItem::View(_) => {
+                            self.report_view_update(id, *schema_id, &from_name.item, -1);
+                            self.report_view_update(id, *schema_id, &to_name.item, 1);
+                        }
+                        CatalogItem::Sink(_) => {
+                            self.report_sink_update(id, *schema_id, &from_name.item, -1);
+                            self.report_sink_update(id, *schema_id, &to_name.item, 1);
+                        }
+                        CatalogItem::Table(_) => {
+                            self.report_table_update(id, *schema_id, &from_name.item, -1);
+                            self.report_table_update(id, *schema_id, &to_name.item, 1);
+                        }
+                        _ => (),
                     }
                 }
                 catalog::OpStatus::DroppedDatabase { name, id } => {
-                    self.update_mz_databases_catalog_view(*id, name, -1);
+                    self.report_database_update(*id, name, -1);
                 }
                 catalog::OpStatus::DroppedSchema {
                     database_id,
                     schema_id,
                     schema_name,
                 } => {
-                    self.update_mz_schemas_catalog_view(
-                        &database_id.to_string(),
-                        *schema_id,
-                        schema_name,
-                        "USER",
-                        -1,
-                    );
+                    self.report_schema_update(*database_id, *schema_id, schema_name, "USER", -1);
                 }
-                catalog::OpStatus::DroppedItem(entry) => {
+                catalog::OpStatus::DroppedIndex { entry, nullable } => match entry.item() {
+                    CatalogItem::Index(index) => {
+                        indexes_to_drop.push(entry.id());
+                        self.report_catalog_update(entry.id(), entry.name().to_string(), -1);
+                        self.report_index_update_inner(entry.id(), index, nullable.to_owned(), -1)
+                    }
+                    _ => unreachable!("DroppedIndex for non-index item"),
+                },
+                catalog::OpStatus::DroppedItem { schema_id, entry } => {
                     self.report_catalog_update(entry.id(), entry.name().to_string(), -1);
                     match entry.item() {
-                        CatalogItem::Table(_) | CatalogItem::Source(_) => {
+                        CatalogItem::Table(_) => {
                             sources_to_drop.push(entry.id());
+                            self.report_table_update(
+                                &entry.id(),
+                                *schema_id,
+                                &entry.name().item,
+                                -1,
+                            );
                         }
-                        CatalogItem::View(_) => (),
+                        CatalogItem::Source(_) => {
+                            sources_to_drop.push(entry.id());
+                            self.report_source_update(
+                                &entry.id(),
+                                *schema_id,
+                                &entry.name().item,
+                                -1,
+                            );
+                        }
+                        CatalogItem::View(_) => {
+                            self.report_view_update(
+                                &entry.id(),
+                                *schema_id,
+                                &entry.name().item,
+                                -1,
+                            );
+                        }
                         CatalogItem::Sink(catalog::Sink {
                             connector: SinkConnectorState::Ready(connector),
                             ..
                         }) => {
                             sinks_to_drop.push(entry.id());
+                            self.report_sink_update(
+                                &entry.id(),
+                                *schema_id,
+                                &entry.name().item,
+                                -1,
+                            );
                             match connector {
                                 SinkConnector::Kafka(KafkaSinkConnector { topic, .. }) => {
                                     let row = Row::pack(&[
@@ -2156,15 +2439,12 @@ where
                             // If the sink connector state is pending, the sink
                             // dataflow was never created, so nothing to drop.
                         }
-                        CatalogItem::Index(_) => indexes_to_drop.push(entry.id()),
+                        CatalogItem::Index(_) => {
+                            unreachable!("dropped indexes should be handled by DroppedIndex");
+                        }
                     }
                     if let Ok(desc) = entry.desc() {
-                        self.update_mz_columns_catalog_view(
-                            desc,
-                            &entry.name().to_string(),
-                            entry.id(),
-                            -1,
-                        );
+                        self.report_column_updates(desc, entry.id(), -1);
                     }
                 }
                 _ => (),
@@ -2242,7 +2522,34 @@ where
                     dataflow.add_source_import(*id, SourceConnector::Local, table.desc.clone());
                 }
                 CatalogItem::Source(source) => {
-                    dataflow.add_source_import(*id, source.connector.clone(), source.desc.clone());
+                    // If Materialize has persistence enabled, check to see if the source has any
+                    // already persisted data that can be reused, and if so, augment the source
+                    // connector to use that data before importing it into the dataflow.
+                    let connector = if let Some(path) = &self.persistence_path {
+                        match crate::persistence::augment_connector(
+                            source.connector.clone(),
+                            path.clone(),
+                            *id,
+                        ) {
+                            Ok(Some(connector)) => Some(connector),
+                            Ok(None) => None,
+                            Err(e) => {
+                                log::error!("encountered error while trying to reuse persisted data for source {}: {}", id.to_string(), e);
+                                log::trace!(
+                                    "continuing without persisted data for source {}",
+                                    id.to_string()
+                                );
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    };
+
+                    // Default back to the regular connector if we didn't get a augmented one.
+                    let connector = connector.unwrap_or_else(|| source.connector.clone());
+
+                    dataflow.add_source_import(*id, connector, source.desc.clone());
                 }
                 CatalogItem::View(view) => {
                     self.import_view_into_dataflow(id, &view.optimized_expr, dataflow);
@@ -2427,18 +2734,16 @@ where
         );
     }
 
-    // Handle metadata surrounding marking a source as persisted.
-    fn enable_source_connector_persistence(
-        &mut self,
-        id: GlobalId,
-        source_connector: SourceConnector,
-    ) {
-        if let SourceConnector::External { connector, .. } = &source_connector {
+    // Tell the persister to start persisting data for `id` if that source
+    // has persistence enabled and Materialize has persistence enabled.
+    // This function is a no-op if the persister has already started persisting
+    // this source.
+    fn maybe_begin_persistence(&mut self, id: GlobalId, source_connector: &SourceConnector) {
+        if let SourceConnector::External { connector, .. } = source_connector {
             if connector.persistence_enabled() {
                 if let Some(persistence_tx) = &mut self.persistence_tx {
                     block_on(persistence_tx.send(PersistenceMessage::AddSource(id)))
                         .expect("failed to send CREATE SOURCE notification to persistence thread");
-                    self.catalog.set_source_connector(id, source_connector);
                 } else {
                     log::error!(
                         "trying to create a persistent source ({}) but persistence is disabled.",
@@ -2504,4 +2809,17 @@ pub fn index_sql(
         if_not_exists: false,
     }
     .to_ast_string_stable()
+}
+
+// Convert a Duration to a Timestamp representing the number
+// of milliseconds contained in that Duration
+fn duration_to_timestamp_millis(d: Duration) -> Timestamp {
+    let millis = d.as_millis();
+    if millis > Timestamp::max_value() as u128 {
+        Timestamp::max_value()
+    } else if millis < Timestamp::min_value() as u128 {
+        Timestamp::min_value()
+    } else {
+        millis as Timestamp
+    }
 }

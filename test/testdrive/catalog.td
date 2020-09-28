@@ -48,10 +48,10 @@ database
 ----
 materialize
 
-# This SELECT should always return the same result as SHOW DATABASES.
 > SELECT * FROM mz_catalog.mz_databases
-global_id   database
+id          database
 -----------------------
+-1          AMBIENT
 1           materialize
 
 # Creating a database should be reflected in the output of SHOW DATABASES.
@@ -62,8 +62,8 @@ database
 d
 materialize
 
-> SELECT * FROM mz_catalog.mz_databases
-global_id   database
+> SELECT * FROM mz_catalog.mz_databases WHERE id != -1
+id          database
 -----------------------
 1           materialize
 2           d
@@ -116,10 +116,16 @@ Expected end of statement, found: RESTRICT
 
 # DROP DATABASE should succeed even when there are objects in the database.
 > DROP DATABASE d
-! SHOW DATABASES
-unknown database 'd'
-! SELECT * FROM mz_catalog.mz_databases
-unknown database 'd'
+# SHOW DATABASES should work, even if the current database has been dropped.
+> SHOW DATABASES
+database
+----
+materialize
+> SELECT * FROM mz_catalog.mz_databases
+id          database
+-----------------------
+-1          AMBIENT
+1           materialize
 
 # The session database should remain set to the dropped database, but future
 # queries that depend on the session database should fail with sensible error
@@ -127,7 +133,7 @@ unknown database 'd'
 > SHOW DATABASE
 d
 ! SELECT * FROM v
-unknown database 'd'
+unknown catalog item 'v'
 
 # But queries that do not depend on the session database should work fine.
 > CREATE VIEW materialize.public.v AS SELECT 1
@@ -182,8 +188,9 @@ d
 d2
 materialize
 > SELECT * FROM mz_catalog.mz_databases
-global_id   database
+id          database
 -----------------------
+-1          AMBIENT
 1           materialize
 2           d
 4           d2
@@ -218,6 +225,11 @@ mz_view_keys
 mz_databases
 mz_schemas
 mz_columns
+mz_indexes
+mz_tables
+mz_sources
+mz_sinks
+mz_views
 
 > SHOW VIEWS FROM mz_catalog
 mz_addresses_with_unit_length

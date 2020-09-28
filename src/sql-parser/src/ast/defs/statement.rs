@@ -40,6 +40,7 @@ pub enum Statement {
     CreateTable(CreateTableStatement),
     CreateIndex(CreateIndexStatement),
     AlterObjectRename(AlterObjectRenameStatement),
+    AlterIndexOptions(AlterIndexOptionsStatement),
     DropDatabase(DropDatabaseStatement),
     DropObjects(DropObjectsStatement),
     SetVariable(SetVariableStatement),
@@ -77,6 +78,7 @@ impl AstDisplay for Statement {
             Statement::CreateTable(stmt) => f.write_node(stmt),
             Statement::CreateIndex(stmt) => f.write_node(stmt),
             Statement::AlterObjectRename(stmt) => f.write_node(stmt),
+            Statement::AlterIndexOptions(stmt) => f.write_node(stmt),
             Statement::DropDatabase(stmt) => f.write_node(stmt),
             Statement::DropObjects(stmt) => f.write_node(stmt),
             Statement::SetVariable(stmt) => f.write_node(stmt),
@@ -104,7 +106,7 @@ impl_display!(Statement);
 /// `SELECT`
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SelectStatement {
-    pub query: Box<Query>,
+    pub query: Query,
     pub as_of: Option<Expr>,
 }
 
@@ -371,7 +373,7 @@ pub struct CreateViewStatement {
     pub name: ObjectName,
     pub columns: Vec<Ident>,
     pub with_options: Vec<SqlOption>,
-    pub query: Box<Query>,
+    pub query: Query,
     pub if_exists: IfExistsBehavior,
     pub temporary: bool,
     pub materialized: bool,
@@ -514,6 +516,46 @@ impl AstDisplay for AlterObjectRenameStatement {
     }
 }
 impl_display!(AlterObjectRenameStatement);
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum AlterIndexOptionsList {
+    Set(Vec<SqlOption>),
+    Reset(Vec<Ident>),
+}
+
+/// `ALTER INDEX ... {RESET, SET}`
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct AlterIndexOptionsStatement {
+    pub index_name: ObjectName,
+    pub if_exists: bool,
+    pub options: AlterIndexOptionsList,
+}
+
+impl AstDisplay for AlterIndexOptionsStatement {
+    fn fmt(&self, f: &mut AstFormatter) {
+        f.write_str("ALTER INDEX ");
+        if self.if_exists {
+            f.write_str("IF EXISTS ");
+        }
+        f.write_node(&self.index_name);
+        f.write_str(" ");
+
+        match &self.options {
+            AlterIndexOptionsList::Set(options) => {
+                f.write_str("SET (");
+                f.write_node(&display::comma_separated(&options));
+                f.write_str(")");
+            }
+            AlterIndexOptionsList::Reset(options) => {
+                f.write_str("RESET (");
+                f.write_node(&display::comma_separated(&options));
+                f.write_str(")");
+            }
+        }
+    }
+}
+
+impl_display!(AlterIndexOptionsStatement);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct DropDatabaseStatement {
@@ -908,7 +950,7 @@ impl_display!(ExplainStatement);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum InsertSource {
-    Query(Box<Query>),
+    Query(Query),
     DefaultValues,
 }
 

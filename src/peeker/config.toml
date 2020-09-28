@@ -12,7 +12,7 @@
 # panics if the `ENV_VAR` is not present and no default value is provided.
 
 [[sources]]
-kafka_broker = "${KAFKA_HOST:-kafka}:9092"
+kafka_broker = "${KAFKA_HOST:-kafka}:${KAFKA_EXTERNAL_PORT:-9092}"
 schema_registry = "http://${SR_HOST:-schema-registry}:8081"
 topic_namespace = "debezium.tpcch."
 materialized = false
@@ -58,7 +58,12 @@ sleep_ms = 0
 [[groups]]
 name = "loadtest"
 queries = ["q01", "q02", "q05", "q06", "q08", "q09", "q12", "q14", "q17", "q19"]
-thread_count = 5
+thread_count = ${OLAP_THREADS:-5}
+
+[[groups]]
+name = "benchmark"
+queries = ["q01", "q02", "q03", "q04", "q05", "q06", "q07", "q08", "q09", "q10", "q11", "q12", "q13", "q14", "q15", "q16", "q17", "q18", "q19", "q20", "q21", "q22"]
+thread_count = ${OLAP_THREADS:-1}
 
 [[queries]]
 name = "q01"
@@ -222,7 +227,7 @@ name = "q08"
 query = """
 SELECT
     extract(year FROM o_entry_d) AS l_year,
-    sum(CASE WHEN n2.n_name = 'GERMANY' THEN ol_amount ELSE 0 END) / sum(ol_amount) AS mkt_share
+    sum(CASE WHEN n2.n_name = 'GERMANY' THEN ol_amount ELSE 0 END) / CASE WHEN sum(ol_amount) = 0 THEN 1 ELSE sum(ol_amount) END AS mkt_share
 FROM item, supplier, stock, orderline, "order", customer, nation n1, nation n2, region
 WHERE i_id = s_i_id
   AND ol_i_id = s_i_id

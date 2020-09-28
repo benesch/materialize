@@ -12,7 +12,6 @@ use std::convert::TryFrom;
 use std::fmt;
 use std::rc::Rc;
 
-use anyhow::Error;
 use digest::Digest;
 use itertools::Itertools;
 use log::{debug, warn};
@@ -24,11 +23,15 @@ use serde::{
 use serde_json::{self, Map, Value};
 use types::{DecimalValue, Value as AvroValue};
 
+use crate::error::Error as AvroError;
 use crate::reader::SchemaResolver;
 use crate::types;
 use crate::util::MapHelper;
 
-pub fn resolve_schemas(writer_schema: &Schema, reader_schema: &Schema) -> Result<Schema, Error> {
+pub fn resolve_schemas(
+    writer_schema: &Schema,
+    reader_schema: &Schema,
+) -> Result<Schema, AvroError> {
     let r_indices = reader_schema.indices.clone();
     let (reader_to_writer_names, writer_to_reader_names): (HashMap<_, _>, HashMap<_, _>) =
         writer_schema
@@ -66,7 +69,7 @@ pub fn resolve_schemas(writer_schema: &Schema, reader_schema: &Schema) -> Result
 }
 
 /// Describes errors happened while parsing Avro schemas.
-#[derive(Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ParseSchemaError(String);
 
 impl ParseSchemaError {
@@ -80,7 +83,7 @@ impl ParseSchemaError {
 
 impl fmt::Display for ParseSchemaError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "Failed to parse schema: {}", self.0)
+        self.0.fmt(f)
     }
 }
 
@@ -185,6 +188,8 @@ pub enum SchemaPiece {
     String,
     /// A `string` Avro schema that is tagged as representing JSON data
     Json,
+    /// A `string` Avro schema with a logical type of `uuid`.
+    Uuid,
     /// A `array` Avro schema. Avro arrays are required to have the same type for each element.
     /// This variant holds the `Schema` for the array element type.
     Array(Box<SchemaPieceOrNamed>),
@@ -233,7 +238,7 @@ pub enum SchemaPiece {
         /// did not match any field in the reader (or even if it matched by name, resolution failed).
         /// If the `i`th element is `Ok((j, piece))`, then the `i`th field of the writer
         /// matched the `j`th field of the reader, and `piece` is their resolved node.
-        permutation: Vec<Result<(usize, SchemaPieceOrNamed), String>>,
+        permutation: Vec<Result<(usize, SchemaPieceOrNamed), AvroError>>,
         n_reader_variants: usize,
         reader_null_variant: Option<usize>,
     },
@@ -337,7 +342,6 @@ impl Schema {
 }
 
 /// This type is used to simplify enum variant comparison between `Schema` and `types::Value`.
-/// It may have utility as part of the public API, but defining as `pub(crate)` for now.
 ///
 /// **NOTE** This type was introduced due to a limitation of `mem::discriminant` requiring a _value_
 /// be constructed in order to get the discriminant, which makes it difficult to implement a
@@ -345,7 +349,7 @@ impl Schema {
 /// intermediate type should be especially fast, as the number of enum variants is small, which
 /// _should_ compile into a jump-table for the conversion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum SchemaKind {
+pub enum SchemaKind {
     // Fixed-length types
     Null,
     Boolean,
@@ -365,6 +369,28 @@ pub(crate) enum SchemaKind {
     // This can arise in resolved schemas, particularly when a union resolves to a non-union.
     // We would need to do a lookup to find the actual type.
     Unknown,
+}
+
+impl SchemaKind {
+    pub fn name(self) -> &'static str {
+        match self {
+            SchemaKind::Null => "null",
+            SchemaKind::Boolean => "boolean",
+            SchemaKind::Int => "int",
+            SchemaKind::Long => "long",
+            SchemaKind::Float => "float",
+            SchemaKind::Double => "double",
+            SchemaKind::Bytes => "bytes",
+            SchemaKind::String => "string",
+            SchemaKind::Array => "array",
+            SchemaKind::Map => "map",
+            SchemaKind::Union => "union",
+            SchemaKind::Record => "record",
+            SchemaKind::Enum => "enum",
+            SchemaKind::Fixed => "fixed",
+            SchemaKind::Unknown => "unknown",
+        }
+    }
 }
 
 impl<'a> From<&'a SchemaPiece> for SchemaKind {
@@ -410,6 +436,7 @@ impl<'a> From<&'a SchemaPiece> for SchemaKind {
             SchemaPiece::ResolveRecord { .. } => SchemaKind::Record,
             SchemaPiece::ResolveEnum { .. } => SchemaKind::Enum,
             SchemaPiece::Json => SchemaKind::String,
+            SchemaPiece::Uuid => SchemaKind::String,
         }
     }
 }
@@ -469,6 +496,9 @@ impl FullName {
             }
         }
     }
+    pub fn base_name(&self) -> &str {
+        &self.name
+    }
 }
 
 impl fmt::Display for FullName {
@@ -492,7 +522,7 @@ impl Name {
     }
 
     /// Parse a `serde_json::Value` into a `Name`.
-    fn parse(complex: &Map<String, Value>) -> Result<Self, Error> {
+    fn parse(complex: &Map<String, Value>) -> Result<Self, AvroError> {
         let name = complex
             .name()
             .ok_or_else(|| ParseSchemaError::new("No `name` field"))?;
@@ -617,7 +647,7 @@ pub struct UnionSchema {
 }
 
 impl UnionSchema {
-    pub(crate) fn new(schemas: Vec<SchemaPieceOrNamed>) -> Result<Self, Error> {
+    pub(crate) fn new(schemas: Vec<SchemaPieceOrNamed>) -> Result<Self, AvroError> {
         let mut avindex = HashMap::new();
         let mut nvindex = HashMap::new();
         for (i, schema) in schemas.iter().enumerate() {
@@ -706,7 +736,7 @@ struct SchemaParser {
 }
 
 impl SchemaParser {
-    fn parse(mut self, value: &Value) -> Result<Schema, Error> {
+    fn parse(mut self, value: &Value) -> Result<Schema, AvroError> {
         let top = self.parse_inner("", value)?;
         let SchemaParser { named, indices } = self;
         Ok(Schema {
@@ -720,7 +750,7 @@ impl SchemaParser {
         &mut self,
         default_namespace: &str,
         value: &Value,
-    ) -> Result<SchemaPieceOrNamed, Error> {
+    ) -> Result<SchemaPieceOrNamed, AvroError> {
         match *value {
             Value::String(ref t) => {
                 let name = FullName::from_parts(t.as_str(), None, default_namespace);
@@ -740,7 +770,7 @@ impl SchemaParser {
         }
     }
 
-    fn alloc_name(&mut self, fullname: FullName) -> Result<usize, Error> {
+    fn alloc_name(&mut self, fullname: FullName) -> Result<usize, AvroError> {
         let idx = match self.indices.entry(fullname) {
             Entry::Vacant(ve) => *ve.insert(self.named.len()),
             Entry::Occupied(oe) => {
@@ -765,7 +795,7 @@ impl SchemaParser {
         type_name: &str,
         default_namespace: &str,
         complex: &Map<String, Value>,
-    ) -> Result<usize, Error> {
+    ) -> Result<usize, AvroError> {
         let name = Name::parse(complex)?;
         match name.name.as_str() {
             "null" | "boolean" | "int" | "long" | "float" | "double" | "bytes" | "string" => {
@@ -807,7 +837,7 @@ impl SchemaParser {
         &mut self,
         default_namespace: &str,
         complex: &Map<String, Value>,
-    ) -> Result<SchemaPieceOrNamed, Error> {
+    ) -> Result<SchemaPieceOrNamed, AvroError> {
         match complex.get("type") {
             Some(&Value::String(ref t)) => Ok(match t.as_str() {
                 "record" | "enum" | "fixed" => SchemaPieceOrNamed::Named(self.parse_named_type(
@@ -849,7 +879,7 @@ impl SchemaParser {
         &mut self,
         default_namespace: &str,
         complex: &Map<String, Value>,
-    ) -> Result<SchemaPiece, Error> {
+    ) -> Result<SchemaPiece, AvroError> {
         let mut lookup = HashMap::new();
 
         let fields: Vec<RecordField> = complex
@@ -884,7 +914,7 @@ impl SchemaParser {
         default_namespace: &str,
         field: &Map<String, Value>,
         position: usize,
-    ) -> Result<RecordField, Error> {
+    ) -> Result<RecordField, AvroError> {
         let name = field
             .name()
             .ok_or_else(|| ParseSchemaError::new("No `name` in record field"))?;
@@ -919,7 +949,7 @@ impl SchemaParser {
 
     /// Parse a `serde_json::Value` representing a Avro enum type into a
     /// `Schema`.
-    fn parse_enum(&mut self, complex: &Map<String, Value>) -> Result<SchemaPiece, Error> {
+    fn parse_enum(&mut self, complex: &Map<String, Value>) -> Result<SchemaPiece, AvroError> {
         let symbols: Vec<String> = complex
             .get("symbols")
             .and_then(|v| v.as_array())
@@ -979,7 +1009,7 @@ impl SchemaParser {
         &mut self,
         default_namespace: &str,
         complex: &Map<String, Value>,
-    ) -> Result<SchemaPiece, Error> {
+    ) -> Result<SchemaPiece, AvroError> {
         complex
             .get("items")
             .ok_or_else(|| ParseSchemaError::new("No `items` in array").into())
@@ -993,7 +1023,7 @@ impl SchemaParser {
         &mut self,
         default_namespace: &str,
         complex: &Map<String, Value>,
-    ) -> Result<SchemaPiece, Error> {
+    ) -> Result<SchemaPiece, AvroError> {
         complex
             .get("values")
             .ok_or_else(|| ParseSchemaError::new("No `values` in map").into())
@@ -1007,7 +1037,7 @@ impl SchemaParser {
         &mut self,
         default_namespace: &str,
         items: &[Value],
-    ) -> Result<SchemaPiece, Error> {
+    ) -> Result<SchemaPiece, AvroError> {
         items
             .iter()
             .map(|value| self.parse_inner(default_namespace, value))
@@ -1017,7 +1047,7 @@ impl SchemaParser {
 
     /// Parse a `serde_json::Value` representing a logical decimal type into a
     /// `Schema`.
-    fn parse_decimal(complex: &Map<String, Value>) -> Result<(usize, usize), Error> {
+    fn parse_decimal(complex: &Map<String, Value>) -> Result<(usize, usize), AvroError> {
         let precision = complex
             .get("precision")
             .and_then(|v| v.as_i64())
@@ -1044,7 +1074,7 @@ impl SchemaParser {
 
     /// Parse a `serde_json::Value` representing an Avro bytes type into a
     /// `Schema`.
-    fn parse_bytes(complex: &Map<String, Value>) -> Result<SchemaPiece, Error> {
+    fn parse_bytes(complex: &Map<String, Value>) -> Result<SchemaPiece, AvroError> {
         let logical_type = complex.get("logicalType").and_then(|v| v.as_str());
 
         if let Some("decimal") = logical_type {
@@ -1073,7 +1103,7 @@ impl SchemaParser {
     /// schema to use is `Date`.
     ///
     /// [1]: https://debezium.io/docs/connectors/mysql/#temporal-values
-    fn parse_int(complex: &Map<String, Value>) -> Result<SchemaPiece, Error> {
+    fn parse_int(complex: &Map<String, Value>) -> Result<SchemaPiece, AvroError> {
         const AVRO_DATE: &str = "date";
         const DEBEZIUM_DATE: &str = "io.debezium.time.Date";
         const KAFKA_DATE: &str = "org.apache.kafka.connect.data.Date";
@@ -1106,7 +1136,7 @@ impl SchemaParser {
     ///
     /// [1]: https://debezium.io/docs/connectors/mysql/#temporal-values
     /// [2]: https://avro.apache.org/docs/1.9.0/spec.html
-    fn parse_long(complex: &Map<String, Value>) -> Result<SchemaPiece, Error> {
+    fn parse_long(complex: &Map<String, Value>) -> Result<SchemaPiece, AvroError> {
         const AVRO_MILLI_TS: &str = "timestamp-millis";
         const AVRO_MICRO_TS: &str = "timestamp-micros";
 
@@ -1146,6 +1176,11 @@ impl SchemaParser {
                 return SchemaPiece::Json;
             }
         }
+        if let Some(name) = complex.get("logicalType") {
+            if name == "uuid" {
+                return SchemaPiece::Uuid;
+            }
+        }
         debug!("parsing complex type as regular string: {:?}", complex);
         SchemaPiece::String
     }
@@ -1156,7 +1191,7 @@ impl SchemaParser {
         &mut self,
         _default_namespace: &str,
         complex: &Map<String, Value>,
-    ) -> Result<SchemaPiece, Error> {
+    ) -> Result<SchemaPiece, AvroError> {
         let _name = Name::parse(complex)?;
 
         let size = complex
@@ -1202,14 +1237,15 @@ impl SchemaParser {
 
 impl Schema {
     /// Create a `Schema` from a string representing a JSON Avro schema.
-    pub fn parse_str(input: &str) -> Result<Self, Error> {
-        let value = serde_json::from_str(input)?;
+    pub fn parse_str(input: &str) -> Result<Self, AvroError> {
+        let value = serde_json::from_str(input)
+            .map_err(|e| ParseSchemaError::new(format!("Error parsing JSON: {}", e)))?;
         Self::parse(&value)
     }
 
     /// Create a `Schema` from a `serde_json::Value` representing a JSON Avro
     /// schema.
-    pub fn parse(value: &Value) -> Result<Self, Error> {
+    pub fn parse(value: &Value) -> Result<Self, AvroError> {
         let p = SchemaParser {
             named: vec![],
             indices: Default::default(),
@@ -1242,7 +1278,7 @@ impl Schema {
 
     /// Parse a `serde_json::Value` representing a primitive Avro type into a
     /// `Schema`.
-    fn parse_primitive(primitive: &str) -> Result<SchemaPiece, Error> {
+    fn parse_primitive(primitive: &str) -> Result<SchemaPiece, AvroError> {
         match primitive {
             "null" => Ok(SchemaPiece::Null),
             "boolean" => Ok(SchemaPiece::Boolean),
@@ -1259,7 +1295,7 @@ impl Schema {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct NamedSchemaPiece {
-    pub(crate) name: FullName,
+    pub name: FullName,
     pub piece: SchemaPiece,
 }
 
@@ -1371,6 +1407,7 @@ impl<'a> SchemaSubtreeDeepCloner<'a> {
             },
             SchemaPiece::Bytes => SchemaPiece::Bytes,
             SchemaPiece::String => SchemaPiece::String,
+            SchemaPiece::Uuid => SchemaPiece::Uuid,
             SchemaPiece::Array(inner) => {
                 SchemaPiece::Array(Box::new(self.clone_piece_or_named(inner.as_ref().as_ref())))
             }
@@ -1734,6 +1771,12 @@ impl<'a> Serialize for SchemaSerContext<'a> {
                     map.serialize_entry("connect.name", "io.debezium.data.Json")?;
                     map.end()
                 }
+                SchemaPiece::Uuid => {
+                    let mut map = serializer.serialize_map(Some(4))?;
+                    map.serialize_entry("type", "string")?;
+                    map.serialize_entry("logicalType", "uuid")?;
+                    map.end()
+                }
                 SchemaPiece::Record { .. }
                 | SchemaPiece::Decimal {
                     fixed_size: Some(_),
@@ -1845,6 +1888,7 @@ impl<'a> Serialize for SchemaSerContext<'a> {
                     | SchemaPiece::Array(_)
                     | SchemaPiece::Map(_)
                     | SchemaPiece::Union(_)
+                    | SchemaPiece::Uuid
                     | SchemaPiece::Json => {
                         unreachable!("Unexpected anonymous schema piece in named schema position")
                     }
@@ -2235,7 +2279,7 @@ mod tests {
         );
         assert_eq!(
             res.unwrap_err().to_string(),
-            "Failed to parse schema: Unions cannot contain duplicate types"
+            "Schema parse error: Unions cannot contain duplicate types"
         );
 
         let writer_schema = Schema::parse_str(

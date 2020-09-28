@@ -33,7 +33,7 @@ SHOW DATABASES WHERE (SELECT true)
 ----
 materialize
 
-statement error WHERE clause must have type bool, not type i32
+statement error WHERE clause error: no overload for bool AND i32
 SHOW DATABASES WHERE 7
 ----
 
@@ -74,27 +74,36 @@ CREATE INDEX idx1 ON v (b)
 query TTTTTT colnames
 SHOW INDEXES FROM v
 ----
-Source_or_view        Key_name                 Column_name Expression Null  Seq_in_index
-materialize.public.v  materialize.public.idx1  b           NULL       false 1
+On_name               Key_name                          Column_name Expression Null  Seq_in_index
+materialize.public.v  materialize.public.idx1           b           NULL       false 1
+materialize.public.v  materialize.public.v_primary_idx  a           NULL       false 1
+materialize.public.v  materialize.public.v_primary_idx  b           NULL       false 2
+materialize.public.v  materialize.public.v_primary_idx  c           NULL       false 3
 
 query TTTTTT colnames
-SHOW INDEXES FROM v WHERE "Column_name" = 'b'
+SHOW INDEXES FROM v WHERE Column_name = 'b'
 ----
-Source_or_view        Key_name                 Column_name Expression Null  Seq_in_index
-materialize.public.v  materialize.public.idx1  b           NULL       false 1
+On_name               Key_name                          Column_name Expression Null  Seq_in_index
+materialize.public.v  materialize.public.idx1           b           NULL       false 1
+materialize.public.v  materialize.public.v_primary_idx  b           NULL       false 2
 
 query TTTTTT colnames
-SHOW INDEXES FROM v WHERE "Column_name" = 'c'
+SHOW INDEXES FROM v WHERE Column_name = 'd'
 ----
-Source_or_view        Key_name                 Column_name Expression Null  Seq_in_index
+On_name               Key_name                 Column_name Expression Null  Seq_in_index
 
 # Reference a different column
 
 query TTTTTT colnames
-SHOW INDEXES FROM v WHERE "Key_name" = 'materialize.public.idx1'
+SHOW INDEXES FROM v WHERE Key_name = 'materialize.public.idx1'
 ----
-Source_or_view        Key_name                 Column_name Expression Null  Seq_in_index
+On_name               Key_name                 Column_name Expression Null  Seq_in_index
 materialize.public.v  materialize.public.idx1  b           NULL       false 1
+
+query TTTTTT colnames
+SHOW INDEXES FROM v WHERE key_name LIKE '%v'
+----
+On_name               Key_name                 Column_name Expression Null  Seq_in_index
 
 # TODO(justin): not handled in parser yet:
 #   SHOW INDEXES FROM v LIKE '%v'
@@ -152,12 +161,12 @@ SHOW VIEWS
 u
 v
 
-query TTBB colnames
+query TTB colnames
 SHOW FULL VIEWS
 ----
-VIEWS TYPE QUERYABLE MATERIALIZED
-u     USER true      true
-v     USER true      true
+VIEWS TYPE MATERIALIZED
+u     USER true
+v     USER true
 
 query T
 SHOW VIEWS LIKE '%u'
@@ -165,7 +174,7 @@ SHOW VIEWS LIKE '%u'
 u
 
 query T
-SHOW VIEWS WHERE "VIEWS" = 'u'
+SHOW VIEWS WHERE views = 'u'
 ----
 u
 
@@ -174,10 +183,23 @@ SHOW SOURCES
 ----
 
 query T
-SHOW SOURCES WHERE "SOURCES" = 'u'
+SHOW SOURCES WHERE sources = 'u'
 ----
 
-# SHOW OBJECTS
+query TTB colnames
+SHOW FULL SOURCES
+----
+SOURCES TYPE MATERIALIZED
+
+query T colnames
+SHOW MATERIALIZED SOURCES
+----
+SOURCES
+
+query TT colnames
+SHOW FULL MATERIALIZED SOURCES
+----
+SOURCES TYPE
 
 query T colnames
 SHOW TABLES
@@ -195,6 +217,16 @@ SHOW TABLES LIKE 'abc'
 ----
 
 query T
-SHOW TABLES WHERE "TABLES" = 'xyz'
+SHOW TABLES WHERE tables = 'xyz'
 ----
 xyz
+
+query T colnames
+SHOW SINKS
+----
+SINKS
+
+query TT colnames
+SHOW FULL SINKS
+----
+SINKS TYPE

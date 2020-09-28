@@ -35,7 +35,7 @@ SOURCES
 -------
 
 > SHOW INDEXES FROM t;
-Source_or_view        Key_name                          Column_name  Expression  Null   Seq_in_index
+On_name               Key_name                          Column_name  Expression  Null   Seq_in_index
 ----------------------------------------------------------------------------------------------------------------
 materialize.public.t  materialize.public.t_primary_idx  a            <null>      true              1
 materialize.public.t  materialize.public.t_primary_idx  b            <null>      false             2
@@ -82,7 +82,7 @@ $ set schema={
 $ kafka-create-topic topic=data
 
 $ kafka-ingest format=avro topic=data schema=${schema} timestamp=1
-{"before": null, "after": {"id": "valid1", "a": 2, "b": 1}}
+{"before": null, "after": {"row":{"id": "valid1", "a": 2, "b": 1}}}
 
 > CREATE MATERIALIZED SOURCE data
   FROM KAFKA BROKER '${testdrive.kafka-addr}' TOPIC 'testdrive-data-${testdrive.seed}'
@@ -125,10 +125,10 @@ a    b
 3    "c"
 
 ! INSERT INTO t DEFAULT VALUES;
-INSERT DEFAULT VALUES not yet supported
+INSERT ... DEFAULT VALUES not yet supported
 
 ! INSERT INTO t SELECT * FROM t;
-INSERT body SELECT * FROM t not yet supported
+complicated INSERT bodies not yet supported
 
 ! INSERT INTO t VALUES (1);
 INSERT statement specifies 2 columns, but table has 1 columns
@@ -138,6 +138,9 @@ NULL value in column b violates not-null constraint
 
 ! INSERT INTO t VALUES ('d', 4);
 expected type string for column b, found i32
+
+! INSERT INTO t WITH v AS (SELECT 1) VALUES (1)
+complicated INSERT bodies not yet supported
 
 > INSERT INTO t VALUES (NULL, 'd');
 
@@ -198,6 +201,11 @@ cannot insert into view 'materialize.public.view'
 
 ! INSERT INTO mz_kafka_sinks VALUES ('bad', 'bad')
 cannot insert into system table 'mz_catalog.mz_kafka_sinks'
+
+> CREATE TABLE j (time TIMESTAMP NOT NULL);
+
+# Verify that INSERT value is desugared.
+> INSERT INTO j VALUES ((TIMESTAMP '2020-08-28 15:08:00'));
 
 # Test that a fairly large INSERT completes.
 > CREATE TABLE large (a int)

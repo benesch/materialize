@@ -62,7 +62,9 @@ impl TypeCategory {
     fn from_type(typ: &ScalarType) -> Self {
         match typ {
             ScalarType::Bool => Self::Bool,
-            ScalarType::Bytes | ScalarType::Jsonb | ScalarType::List(_) => Self::UserDefined,
+            ScalarType::Bytes | ScalarType::Jsonb | ScalarType::Uuid | ScalarType::List(_) => {
+                Self::UserDefined
+            }
             ScalarType::Date
             | ScalarType::Time
             | ScalarType::Timestamp
@@ -829,6 +831,9 @@ lazy_static! {
                     }
                 })
             },
+            "mz_cluster_id" => {
+                params!() => nullary_op(mz_cluster_id)
+            },
             "now" => {
                 params!() => nullary_op(|ecx| plan_current_timestamp(ecx, "now"))
             },
@@ -902,6 +907,13 @@ fn plan_current_timestamp(ecx: &ExprContext, name: &str) -> Result<ScalarExpr, a
         )),
         QueryLifetime::Static => bail!("{} cannot be used in static queries", name),
     }
+}
+
+fn mz_cluster_id(ecx: &ExprContext) -> Result<ScalarExpr, anyhow::Error> {
+    Ok(ScalarExpr::literal(
+        Datum::from(ecx.qcx.scx.catalog.cluster_id()),
+        ScalarType::Uuid,
+    ))
 }
 
 fn stringify_opt_scalartype(t: &Option<ScalarType>) -> String {

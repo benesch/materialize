@@ -195,7 +195,7 @@ impl Parser {
                     "SELECT" | "WITH" | "VALUES" => {
                         self.prev_token();
                         Ok(Statement::Select(SelectStatement {
-                            query: Box::new(self.parse_query()?),
+                            query: self.parse_query()?,
                             as_of: self.parse_optional_as_of()?,
                         }))
                     }
@@ -229,7 +229,7 @@ impl Parser {
                 Token::LParen => {
                     self.prev_token();
                     Ok(Statement::Select(SelectStatement {
-                        query: Box::new(self.parse_query()?),
+                        query: self.parse_query()?,
                         as_of: None, // Only the outermost SELECT may have an AS OF clause.
                     }))
                 }
@@ -1622,7 +1622,7 @@ impl Parser {
         let columns = self.parse_parenthesized_column_list(Optional)?;
         let with_options = self.parse_with_options()?;
         self.expect_keyword("AS")?;
-        let query = Box::new(self.parse_query()?);
+        let query = self.parse_query()?;
         // Optional `WITH [ CASCADED | LOCAL ] CHECK OPTION` is widely supported here.
         Ok(Statement::CreateView(CreateViewStatement {
             name,
@@ -1921,17 +1921,49 @@ impl Parser {
     }
 
     fn parse_alter(&mut self) -> Result<Statement, ParserError> {
-        let object_type = match self.expect_one_of_keywords(&["INDEX", "SINK", "SOURCE", "VIEW"])? {
-            "INDEX" => ObjectType::Index,
-            "SINK" => ObjectType::Sink,
-            "SOURCE" => ObjectType::Source,
-            "VIEW" => ObjectType::View,
-            _ => unreachable!(),
-        };
+        let object_type =
+            match self.expect_one_of_keywords(&["INDEX", "SINK", "SOURCE", "VIEW", "TABLE"])? {
+                "INDEX" => ObjectType::Index,
+                "SINK" => ObjectType::Sink,
+                "SOURCE" => ObjectType::Source,
+                "VIEW" => ObjectType::View,
+                "TABLE" => ObjectType::Table,
+                _ => unreachable!(),
+            };
 
         let if_exists = self.parse_if_exists()?;
         let name = self.parse_object_name()?;
-        // `RENAME` is the only `ALTER` clause we currently support.
+
+        // We support `ALTER INDEX ... {RESET, SET} and `ALTER <object type> RENAME
+        if object_type == ObjectType::Index {
+            let options = match self.parse_one_of_keywords(&["RESET", "SET"]) {
+                Some("RESET") => {
+                    self.expect_token(&Token::LParen)?;
+                    let reset_options = self.parse_comma_separated(Parser::parse_identifier)?;
+                    self.expect_token(&Token::RParen)?;
+
+                    Some(AlterIndexOptionsList::Reset(reset_options))
+                }
+                Some("SET") => {
+                    self.expect_token(&Token::LParen)?;
+                    let set_options = self.parse_comma_separated(Parser::parse_sql_option)?;
+                    self.expect_token(&Token::RParen)?;
+
+                    Some(AlterIndexOptionsList::Set(set_options))
+                }
+                Some(_) => unreachable!(),
+                None => None,
+            };
+
+            if let Some(options) = options {
+                return Ok(Statement::AlterIndexOptions(AlterIndexOptionsStatement {
+                    index_name: name,
+                    if_exists,
+                    options,
+                }));
+            }
+        }
+
         self.expect_keywords(&["RENAME", "TO"])?;
         let to_item_name = self.parse_identifier()?;
 
@@ -2871,7 +2903,7 @@ impl Parser {
         let source = if self.parse_keywords(vec!["DEFAULT", "VALUES"]) {
             InsertSource::DefaultValues
         } else {
-            InsertSource::Query(Box::new(self.parse_query()?))
+            InsertSource::Query(self.parse_query()?)
         };
         Ok(Statement::Insert(InsertStatement {
             table_name,

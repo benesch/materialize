@@ -10,7 +10,7 @@
 //! Integration tests for pgwire functionality.
 
 use std::error::Error;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
 
@@ -31,27 +31,8 @@ pub mod util;
 fn test_bind_params() -> Result<(), Box<dyn Error>> {
     ore::test::init_logging();
 
-    let (_server, mut client) = util::start_server(util::Config::default())?;
-
-    // Simple queries with parameters should be rejected.
-    match client.simple_query("SELECT $1") {
-        Ok(_) => panic!("query with invalid parameters executed successfully"),
-        Err(err) => assert_eq!(err.code(), Some(&SqlState::UNDEFINED_PARAMETER)),
-    }
-
-    let val: String = client
-        .query_one("SELECT $1", &[&String::from("42")])?
-        .get(0);
-    assert_eq!(val, "42");
-
-    let val: i32 = client.query_one("SELECT $1 + 1", &[&42_i32])?.get(0);
-    assert_eq!(val, 43);
-
-    let val: i32 = client.query_one("SELECT $1 - 1", &[&42_i32])?.get(0);
-    assert_eq!(val, 41);
-
-    let val: i32 = client.query_one("SELECT 1 - $1", &[&42_i32])?.get(0);
-    assert_eq!(val, -41);
+    let config = util::Config::default().experimental_mode();
+    let (_server, mut client) = util::start_server(config)?;
 
     match client.query("SELECT ROW(1, 2) = $1", &[&42_i32]) {
         Ok(_) => panic!("query with invalid parameters executed successfully"),
@@ -85,6 +66,25 @@ fn test_bind_params() -> Result<(), Box<dyn Error>> {
         let stmt = client.prepare_typed("SELECT $1 + 1.23", &[Type::NUMERIC])?;
         let val: Numeric = client.query_one(&stmt, &[&num])?.get(0);
         assert_eq!(val.to_string(), "2.46");
+    }
+
+    // A `CREATE` statement with parameters should be rejected.
+    match client.query_one("CREATE VIEW v AS SELECT $3", &[]) {
+        Ok(_) => panic!("query with invalid parameters executed successfully"),
+        Err(err) => {
+            assert!(err.to_string().contains("there is no parameter $3"));
+            // TODO(benesch): this should be `UNDEFINED_PARAMETER`, but blocked
+            // on #3147.
+            assert_eq!(err.code(), Some(&SqlState::INTERNAL_ERROR));
+        }
+    }
+
+    // Test that `INSERT` statements support prepared statements.
+    {
+        client.batch_execute("CREATE TABLE t (a int)")?;
+        client.query("INSERT INTO t VALUES ($1)", &[&42_i32])?;
+        let val: i32 = client.query_one("SELECT * FROM t", &[])?.get(0);
+        assert_eq!(val, 42);
     }
 
     Ok(())
@@ -415,6 +415,31 @@ fn test_record_types() -> Result<(), Box<dyn Error>> {
     let row = client.query_one("SELECT (1, 'a')", &[])?;
     let record: Record<(i32, String)> = row.get(0);
     assert_eq!(record, Record((1, "a".into())));
+
+    Ok(())
+}
+
+#[test]
+fn test_pgtest() -> Result<(), Box<dyn Error>> {
+    ore::test::init_logging();
+
+    let dir: PathBuf = ["..", "..", "test", "pgtest"].iter().collect();
+
+    // We want a new server per file, so we can't use pgtest::walk.
+    datadriven::walk(dir.to_str().unwrap(), |tf| {
+        let (server, _client) = util::start_server(util::Config::default()).unwrap();
+        let config = server.pg_config();
+        let addr = match &config.get_hosts()[0] {
+            tokio_postgres::config::Host::Tcp(host) => {
+                format!("{}:{}", host, config.get_ports()[0])
+            }
+            _ => panic!("only tcp connections supported"),
+        };
+        let user = config.get_user().unwrap();
+        let timeout = Duration::from_secs(5);
+
+        pgtest::run_test(tf, &addr, user, timeout);
+    });
 
     Ok(())
 }

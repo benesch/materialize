@@ -25,10 +25,11 @@ use serde_json::Value as JsonValue;
 // Re-export components from the various other Avro libraries, so that other
 // testdrive modules can import just this one.
 
-pub use avro::schema::{Schema, SchemaNode, SchemaPiece, SchemaPieceOrNamed};
-pub use avro::types::{DecimalValue, ToAvro, Value};
-pub use avro::{from_avro_datum, to_avro_datum, Codec, Reader, Writer};
 pub use interchange::avro::parse_schema;
+use mz_avro::schema::SchemaKind;
+pub use mz_avro::schema::{Schema, SchemaNode, SchemaPiece, SchemaPieceOrNamed};
+pub use mz_avro::types::{DecimalValue, ToAvro, Value};
+pub use mz_avro::{from_avro_datum, to_avro_datum, Codec, Reader, Writer};
 
 // This function is derived from code in the avro_rs project. Update the license
 // header on this file accordingly if you move it to a new home.
@@ -114,6 +115,10 @@ pub fn from_json(json: &JsonValue, schema: SchemaNode) -> Result<Value, String> 
             let j = serde_json::from_str(s).map_err(|e| e.to_string())?;
             Ok(Value::Json(j))
         }
+        (JsonValue::String(s), SchemaPiece::Uuid) => {
+            let u = uuid::Uuid::parse_str(&s).map_err(|e| e.to_string())?;
+            Ok(Value::Uuid(u))
+        }
         (JsonValue::String(s), SchemaPiece::Enum { symbols, .. }) => {
             if symbols.contains(s) {
                 Ok(Value::String(s.clone()))
@@ -122,7 +127,7 @@ pub fn from_json(json: &JsonValue, schema: SchemaNode) -> Result<Value, String> 
             }
         }
         (JsonValue::Object(items), SchemaPiece::Record { .. }) => {
-            let mut builder = avro::types::Record::new(schema)
+            let mut builder = mz_avro::types::Record::new(schema)
                 .expect("`Record::new` should never fail if schema piece is a record!");
             for (key, val) in items {
                 let field = builder
@@ -135,25 +140,60 @@ pub fn from_json(json: &JsonValue, schema: SchemaNode) -> Result<Value, String> 
         }
         (val, SchemaPiece::Union(us)) => {
             let variants = us.variants();
-            let mut last_err = format!("Union schema {:?} did not match {:?}", variants, val);
             let null_variant = variants
                 .iter()
                 .position(|v| v == &SchemaPieceOrNamed::Piece(SchemaPiece::Null));
+            if let JsonValue::Null = val {
+                return if let Some(nv) = null_variant {
+                    Ok(Value::Union {
+                        index: nv,
+                        inner: Box::new(Value::Null),
+                        n_variants: variants.len(),
+                        null_variant,
+                    })
+                } else {
+                    Err("No `null` value in union schema.".to_string())
+                };
+            }
+            let items = match val {
+                JsonValue::Object(items) => items,
+                _ => return Err(format!("Union schema element must be `null` or a map from type name to value; found {:?}", val))
+            };
+            let (name, val) = if items.len() == 1 {
+                (items.keys().next().unwrap(), items.values().next().unwrap())
+            } else {
+                return Err(format!(
+                    "Expected one-element object to match union schema: {:?} vs {:?}",
+                    json, schema
+                ));
+            };
             for (i, variant) in variants.iter().enumerate() {
-                match from_json(val, schema.step(variant)) {
-                    Ok(avro) => {
-                        return Ok(Value::Union {
-                            index: i,
-
-                            inner: Box::new(avro),
-                            n_variants: variants.len(),
-                            null_variant,
-                        })
+                let name_matches = match variant {
+                    SchemaPieceOrNamed::Piece(piece) => SchemaKind::from(piece).name() == name,
+                    SchemaPieceOrNamed::Named(idx) => {
+                        let schema_name = &schema.root.lookup(*idx).name;
+                        if name.chars().any(|ch| ch == '.') {
+                            name == &schema_name.to_string()
+                        } else {
+                            name == schema_name.base_name()
+                        }
                     }
-                    Err(msg) => last_err = msg,
+                };
+                if name_matches {
+                    match from_json(val, schema.step(variant)) {
+                        Ok(avro) => {
+                            return Ok(Value::Union {
+                                index: i,
+                                inner: Box::new(avro),
+                                n_variants: variants.len(),
+                                null_variant,
+                            })
+                        }
+                        Err(msg) => return Err(msg),
+                    }
                 }
             }
-            Err(last_err)
+            Err(format!("Type not found in union: {}", name))
         }
         _ => Err(format!(
             "unable to match JSON value to schema: {:?} vs {:?}",
@@ -177,12 +217,21 @@ where
         .collect::<Result<Vec<_>, String>>()?;
     let mut expected = expected.iter();
     let mut actual = actual.iter();
-    for (i, (e, a)) in (&mut expected).zip(&mut actual).enumerate() {
-        if e != a {
-            return Err(format!(
-                "record {} did not match\nexpected:\n{:#?}\n\nactual:\n{:#?}",
-                i, e, a
-            ));
+    let mut index = 0..;
+    loop {
+        let i = index.next().expect("known to exist");
+        match (expected.next(), actual.next()) {
+            (Some(e), Some(a)) => {
+                if e != a {
+                    return Err(format!(
+                        "record {} did not match\nexpected:\n{:#?}\n\nactual:\n{:#?}",
+                        i, e, a
+                    ));
+                }
+            }
+            (Some(e), None) => return Err(format!("missing record {}: {:#?}", i, e)),
+            (None, Some(a)) => return Err(format!("extra record {}: {:#?}", i, a)),
+            (None, None) => break,
         }
     }
     let expected: Vec<_> = expected.map(|e| format!("{:#?}", e)).collect();

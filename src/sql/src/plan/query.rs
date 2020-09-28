@@ -29,16 +29,18 @@ use std::mem;
 use anyhow::{anyhow, bail, ensure, Context};
 use sql_parser::ast::visit::{self, Visit};
 use sql_parser::ast::{
-    BinaryOperator, DataType, Expr, Function, FunctionArgs, Ident, JoinConstraint, JoinOperator,
-    ObjectName, OrderByExpr, Query, Select, SelectItem, SetExpr, SetOperator, ShowStatementFilter,
+    BinaryOperator, DataType, Expr, Function, FunctionArgs, Ident, InsertSource, JoinConstraint,
+    JoinOperator, ObjectName, OrderByExpr, Query, Select, SelectItem, SetExpr, SetOperator,
     TableAlias, TableFactor, TableWithJoins, Value, Values,
 };
 
-use ::expr::{Id, RowSetFinishing};
-use dataflow_types::Timestamp;
+use ::expr::{GlobalId, Id, RowSetFinishing};
 use repr::adt::decimal::{Decimal, MAX_DECIMAL_PRECISION};
-use repr::{strconv, ColumnName, Datum, RelationDesc, RelationType, RowArena, ScalarType};
+use repr::{
+    strconv, ColumnName, Datum, RelationDesc, RelationType, RowArena, ScalarType, Timestamp,
+};
 
+use crate::catalog::CatalogItemType;
 use crate::names::PartialName;
 use crate::normalize;
 use crate::plan::error::PlanError;
@@ -104,62 +106,74 @@ pub fn plan_root_query(
     Ok((expr, desc, finishing))
 }
 
-/// Plans a SHOW statement that might have a WHERE or LIKE clause attached to it. A LIKE clause is
-/// treated as a WHERE applied to the first column in the result set.
-pub fn plan_show_where(
+pub fn plan_insert_query(
     scx: &StatementContext,
-    filter: Option<ShowStatementFilter>,
-    rows: Vec<Vec<Datum>>,
-    desc: &RelationDesc,
-) -> Result<(RelationExpr, RowSetFinishing), anyhow::Error> {
-    let names: Vec<Option<String>> = desc
-        .iter_names()
-        .map(|name| name.map(|x| x.as_str().into()))
-        .collect();
+    table_name: ObjectName,
+    source: InsertSource,
+) -> Result<(GlobalId, RelationExpr), anyhow::Error> {
+    let name = scx.resolve_item(table_name)?;
+    let table = scx.catalog.get_item(&name);
+    let desc = table.desc()?;
 
-    let num_cols = names.len();
-    let mut row_expr = RelationExpr::constant(rows, desc.typ().clone());
-
-    if let Some(f) = filter {
-        let mut predicate = match &f {
-            ShowStatementFilter::Like(s) => Expr::BinaryOp {
-                left: Box::new(Expr::Identifier(vec![Ident::new(
-                    names[0].clone().unwrap(),
-                )])),
-                op: BinaryOperator::Like,
-                right: Box::new(Expr::Value(Value::String(s.into()))),
-            },
-            ShowStatementFilter::Where(selection) => selection.clone(),
-        };
-        let qcx = QueryContext::root(scx, QueryLifetime::OneShot);
-        let scope = Scope::from_source(None, names, None);
-        let ecx = ExprContext {
-            qcx: &qcx,
-            name: "SHOW WHERE clause",
-            scope: &scope,
-            relation_type: &qcx.relation_type(&row_expr),
-            allow_aggregates: false,
-            allow_subqueries: true,
-        };
-        transform_ast::transform_expr(&mut predicate)?;
-        let expr = plan_expr(&ecx, &predicate)?.type_as(&ecx, ScalarType::Bool)?;
-        row_expr = row_expr.filter(vec![expr]);
+    // Validate the target of the insert.
+    if table.item_type() != CatalogItemType::Table {
+        bail!(
+            "cannot insert into {} '{}'",
+            table.item_type(),
+            table.name()
+        );
+    }
+    if table.id().is_system() {
+        bail!("cannot insert into system table '{}'", table.name());
     }
 
-    Ok((
-        row_expr,
-        RowSetFinishing {
-            order_by: (0..num_cols)
-                .map(|c| ColumnOrder {
-                    column: c,
-                    desc: false,
-                })
-                .collect(),
-            limit: None,
-            offset: 0,
-            project: (0..num_cols).collect(),
-        },
-    ))
+    // Plan the source.
+    let (expr, typ) = match source {
+        InsertSource::Query(Query {
+            body: SetExpr::Values(mut values),
+            ctes,
+            order_by,
+            limit,
+            offset,
+            fetch,
+        }) if ctes.is_empty()
+            && order_by.is_empty()
+            && limit.is_none()
+            && offset.is_none()
+            && fetch.is_none() =>
+        {
+            transform_ast::transform_values(&mut values)?;
+            let type_hints = Some(desc.iter_types().map(|typ| &typ.scalar_type).collect());
+            let qcx = QueryContext::root(scx, QueryLifetime::OneShot);
+            let (expr, _scope) = plan_values(&qcx, &values.0, type_hints)?;
+            let typ = qcx.relation_type(&expr);
+            (expr, typ)
+        }
+        InsertSource::Query(..) => unsupported!("complicated INSERT bodies"),
+        InsertSource::DefaultValues => unsupported!("INSERT ... DEFAULT VALUES"),
+    };
+
+    // Validate that the type of the source query matches the type
+    // of the target table.
+    if typ.arity() != desc.arity() {
+        bail!(
+            "INSERT statement specifies {} columns, but table has {} columns",
+            desc.arity(),
+            typ.arity(),
+        );
+    }
+    for ((name, exp_typ), typ) in desc.iter().zip(&typ.column_types) {
+        if typ.scalar_type != exp_typ.scalar_type {
+            bail!(
+                "expected type {} for column {}, found {}",
+                exp_typ.scalar_type,
+                name.unwrap_or(&ColumnName::from("unnamed column")),
+                typ,
+            );
+        }
+    }
+
+    Ok((table.id(), expr))
 }
 
 /// Evaluates an expression in the AS OF position of a TAIL statement.
@@ -503,15 +517,6 @@ fn plan_values(
     Ok((out, scope))
 }
 
-pub fn plan_insert_query(
-    scx: &StatementContext,
-    values: &Values,
-    type_hints: Option<Vec<&ScalarType>>,
-) -> Result<RelationExpr, anyhow::Error> {
-    let qcx = QueryContext::root(scx, QueryLifetime::OneShot);
-    Ok(plan_values(&qcx, &values.0, type_hints)?.0)
-}
-
 fn plan_join_identity(qcx: &QueryContext) -> (RelationExpr, Scope) {
     let typ = RelationType::new(vec![]);
     let expr = RelationExpr::constant(vec![vec![]], typ);
@@ -582,7 +587,9 @@ fn plan_view_select_intrusive(
             allow_aggregates: false,
             allow_subqueries: true,
         };
-        let expr = plan_expr(ecx, &selection)?.type_as(ecx, ScalarType::Bool)?;
+        let expr = plan_expr(ecx, &selection)
+            .map_err(|e| anyhow::anyhow!("WHERE clause error: {}", e))?
+            .type_as(ecx, ScalarType::Bool)?;
         relation_expr = relation_expr.filter(vec![expr]);
     }
 
@@ -2111,13 +2118,13 @@ pub fn scalar_type_from_sql(data_type: &DataType) -> Result<ScalarType, anyhow::
         DataType::Interval => ScalarType::Interval,
         DataType::Bytea => ScalarType::Bytes,
         DataType::Jsonb => ScalarType::Jsonb,
+        DataType::Uuid => ScalarType::Uuid,
         DataType::List(elem_type) => ScalarType::List(Box::new(scalar_type_from_sql(elem_type)?)),
         other @ DataType::Binary(..)
         | other @ DataType::Blob(_)
         | other @ DataType::Clob(_)
         | other @ DataType::Regclass
         | other @ DataType::TimeTz
-        | other @ DataType::Uuid
         | other @ DataType::Varbinary(_) => bail!("Unexpected SQL type: {:?}", other),
     })
 }
@@ -2138,6 +2145,7 @@ pub fn scalar_type_from_pg(ty: &pgrepr::Type) -> Result<ScalarType, anyhow::Erro
         pgrepr::Type::Bytea => Ok(ScalarType::Bytes),
         pgrepr::Type::Text => Ok(ScalarType::String),
         pgrepr::Type::Jsonb => Ok(ScalarType::Jsonb),
+        pgrepr::Type::Uuid => Ok(ScalarType::Uuid),
         pgrepr::Type::List(l) => Ok(ScalarType::List(Box::new(scalar_type_from_pg(l)?))),
         pgrepr::Type::Record(_) => {
             bail!("internal error: can't convert from pg record to materialize record")

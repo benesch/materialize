@@ -18,6 +18,9 @@
 //! Builtin's names, columns, and types are part of the stable API of
 //! Materialize. Be careful to maintain backwards compatibility when changing
 //! definitions of existing builtins!
+//!
+//! More information about builtin system tables and types can be found in
+//! https://materialize.io/docs/sql/system-tables/.
 
 use std::collections::BTreeMap;
 
@@ -238,7 +241,7 @@ lazy_static! {
     pub static ref MZ_DATABASES: BuiltinTable = BuiltinTable {
         name: "mz_databases",
         desc: RelationDesc::empty()
-            .with_column("global_id", ScalarType::String.nullable(false))
+            .with_column("id", ScalarType::Int64.nullable(false))
             .with_column("database", ScalarType::String.nullable(false)),
         id: GlobalId::System(2011),
         index_id: GlobalId::System(2012),
@@ -246,8 +249,8 @@ lazy_static! {
     pub static ref MZ_SCHEMAS: BuiltinTable = BuiltinTable {
         name: "mz_schemas",
         desc: RelationDesc::empty()
-            .with_column("schema_id", ScalarType::String.nullable(false))
-            .with_column("database_id", ScalarType::String.nullable(false))
+            .with_column("database_id", ScalarType::Int64.nullable(false))
+            .with_column("schema_id", ScalarType::Int64.nullable(false))
             .with_column("schema", ScalarType::String.nullable(false))
             .with_column("type", ScalarType::String.nullable(false)),
         id: GlobalId::System(2013),
@@ -256,7 +259,6 @@ lazy_static! {
     pub static ref MZ_COLUMNS: BuiltinTable = BuiltinTable {
         name: "mz_columns",
         desc: RelationDesc::empty()
-            .with_column("qualified_name", ScalarType::String.nullable(false))
             .with_column("global_id", ScalarType::String.nullable(false))
             .with_column("field_number", ScalarType::Int64.nullable(false))
             .with_column("field", ScalarType::String.nullable(false))
@@ -264,6 +266,54 @@ lazy_static! {
             .with_column("type", ScalarType::String.nullable(false)),
         id: GlobalId::System(2015),
         index_id: GlobalId::System(2016),
+    };
+    pub static ref MZ_INDEXES: BuiltinTable = BuiltinTable {
+        name: "mz_indexes",
+        desc: RelationDesc::empty()
+            .with_column("global_id", ScalarType::String.nullable(false))
+            .with_column("on_global_id", ScalarType::String.nullable(false))
+            .with_column("field_number", ScalarType::Int64.nullable(true))
+            .with_column("expression", ScalarType::String.nullable(true))
+            .with_column("nullable", ScalarType::Bool.nullable(false))
+            .with_column("seq_in_index", ScalarType::Int64.nullable(false)),
+        id: GlobalId::System(2017),
+        index_id: GlobalId::System(2018),
+    };
+    pub static ref MZ_TABLES: BuiltinTable = BuiltinTable {
+        name: "mz_tables",
+        desc: RelationDesc::empty()
+            .with_column("global_id", ScalarType::String.nullable(false))
+            .with_column("schema_id", ScalarType::Int64.nullable(false))
+            .with_column("tables", ScalarType::String.nullable(false)),
+        id: GlobalId::System(2019),
+        index_id: GlobalId::System(2020),
+    };
+    pub static ref MZ_SOURCES: BuiltinTable = BuiltinTable {
+        name: "mz_sources",
+        desc: RelationDesc::empty()
+            .with_column("global_id", ScalarType::String.nullable(false))
+            .with_column("schema_id", ScalarType::Int64.nullable(false))
+            .with_column("sources", ScalarType::String.nullable(false)),
+        id: GlobalId::System(2021),
+        index_id: GlobalId::System(2022),
+    };
+    pub static ref MZ_SINKS: BuiltinTable = BuiltinTable {
+        name: "mz_sinks",
+        desc: RelationDesc::empty()
+            .with_column("global_id", ScalarType::String.nullable(false))
+            .with_column("schema_id", ScalarType::Int64.nullable(false))
+            .with_column("sinks", ScalarType::String.nullable(false)),
+        id: GlobalId::System(2023),
+        index_id: GlobalId::System(2024),
+    };
+    pub static ref MZ_VIEWS: BuiltinTable = BuiltinTable {
+        name: "mz_views",
+        desc: RelationDesc::empty()
+            .with_column("global_id", ScalarType::String.nullable(false))
+            .with_column("schema_id", ScalarType::Int64.nullable(false))
+            .with_column("views", ScalarType::String.nullable(false)),
+        id: GlobalId::System(2025),
+        index_id: GlobalId::System(2026),
     };
 }
 
@@ -465,6 +515,11 @@ lazy_static! {
             Builtin::Table(&MZ_DATABASES),
             Builtin::Table(&MZ_SCHEMAS),
             Builtin::Table(&MZ_COLUMNS),
+            Builtin::Table(&MZ_INDEXES),
+            Builtin::Table(&MZ_TABLES),
+            Builtin::Table(&MZ_SOURCES),
+            Builtin::Table(&MZ_SINKS),
+            Builtin::Table(&MZ_VIEWS),
             Builtin::View(&MZ_ADDRESSES_WITH_UNIT_LENGTHS),
             Builtin::View(&MZ_DATAFLOW_NAMES),
             Builtin::View(&MZ_DATAFLOW_OPERATOR_DATAFLOWS),

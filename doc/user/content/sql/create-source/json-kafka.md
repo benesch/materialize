@@ -7,10 +7,8 @@ menu:
 ---
 
 {{% create-source/intro %}}
-This document details how to connect Materialize to JSON-formatted Kinesis
-streams.
-
-{{< kinesis-alpha >}}
+This document details how to connect Materialize to JSON-formatted Kafka
+topics.
 
 {{% /create-source/intro %}}
 
@@ -24,7 +22,7 @@ streams.
 
 ```sql
 CREATE SOURCE json_kafka
-KAFKA BROKER 'localhost:9092' TOPIC 'json'
+FROM KAFKA BROKER 'localhost:9092' TOPIC 'json'
 FORMAT BYTES;
 ```
 
@@ -44,6 +42,21 @@ CREATE MATERIALIZED VIEW jsonified_kafka_source AS
       FROM json_kafka
   )
 ```
+
+### Persisting records to local disk
+
+```sql
+CREATE SOURCE json_kafka
+FROM KAFKA BROKER 'localhost:9092' TOPIC 'json'
+WITH (persistence = true)
+FORMAT BYTES;
+```
+
+This creates a source that...
+
+- Is append-only.
+- Has one column, `data`, which represents the stream's incoming bytes.
+- Persists messages from the `json` topic to local disk.
 
 ## Related pages
 
