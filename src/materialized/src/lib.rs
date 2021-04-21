@@ -111,9 +111,6 @@ pub struct Config {
     pub data_directory: PathBuf,
     pub persistence: Option<PersistenceConfig>,
     pub cache: Option<CacheConfig>,
-    /// An optional symbiosis endpoint. See the
-    /// [`symbiosis`](../symbiosis/index.html) crate for details.
-    pub symbiosis_url: Option<String>,
     /// Whether to permit usage of experimental features.
     pub experimental_mode: bool,
     /// Whether to run in safe mode.
@@ -216,7 +213,6 @@ pub async fn serve(
         coord::Config {
             workers,
             timely_worker: config.timely_worker,
-            symbiosis_url: config.symbiosis_url.as_deref(),
             logging: config.logging,
             data_directory: &config.data_directory,
             timestamp_frequency: config.timestamp_frequency,

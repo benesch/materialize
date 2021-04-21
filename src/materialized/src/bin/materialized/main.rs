@@ -249,9 +249,6 @@ struct Args {
         default_value = "mzdata"
     )]
     data_directory: PathBuf,
-    /// Enable symbioisis with a PostgreSQL server.
-    #[structopt(long, env = "MZ_SYMBIOSIS", hidden = true)]
-    symbiosis: Option<String>,
 
     // === Telemetry options. ===
     // TODO(benesch): add an environment variable once we upgrade to clap v3.
@@ -602,7 +599,6 @@ swap: {swap_total}KB total, {swap_used}KB used",
             listen_addr: args.listen_addr,
             tls,
             data_directory,
-            symbiosis_url: args.symbiosis,
             experimental_mode: args.experimental,
             safe_mode: args.safe,
             telemetry_url,

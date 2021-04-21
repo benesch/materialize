@@ -545,7 +545,6 @@ dependencies = [
  "sql",
  "sql-parser",
  "storage",
- "symbiosis",
  "tempfile",
  "timely",
  "tokio",
@@ -4202,26 +4201,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "502d53007c02d7605a05df1c1a73ee436952781653da5d0bf57ad608f66932c1"
 
 [[package]]
-name = "symbiosis"
-version = "0.0.0"
-dependencies = [
- "anyhow",
- "chrono",
- "dataflow-types",
- "expr",
- "log",
- "ore",
- "pgrepr",
- "repr",
- "serde_json",
- "sql",
- "tokio",
- "tokio-postgres",
- "uuid",
- "whoami",
-]
-
-[[package]]
 name = "symbolic-common"
 version = "8.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5008,16 +4987,6 @@ checksum = "721c6263e2c66fd44501cc5efbfa2b7dfa775d13e4ea38c46299646ed1f9c70a"
 dependencies = [
  "js-sys",
  "wasm-bindgen",
-]
-
-[[package]]
-name = "whoami"
-version = "1.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4abacf325c958dfeaf1046931d37f2a901b6dfe0968ee965a29e94c6766b2af6"
-dependencies = [
- "wasm-bindgen",
- "web-sys",
 ]
 
 [[package]]
