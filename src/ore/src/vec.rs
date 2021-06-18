@@ -40,7 +40,9 @@ pub trait Vector<T> {
     fn push(&mut self, value: T);
 
     /// Copies and appends all elements in a slice to the vector.
-    fn extend_from_slice(&mut self, other: &[T]) where T: Copy;
+    fn extend_from_slice(&mut self, other: &[T])
+    where
+        T: Copy;
 }
 
 impl<T> Vector<T> for Vec<T> {
@@ -58,7 +60,7 @@ impl<T> Vector<T> for Vec<T> {
 
 impl<A> Vector<A::Item> for SmallVec<A>
 where
-    A: smallvec::Array
+    A: smallvec::Array,
 {
     fn push(&mut self, value: A::Item) {
         SmallVec::push(self, value)
