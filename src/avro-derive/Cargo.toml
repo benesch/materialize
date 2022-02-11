@@ -1,14 +1,15 @@
 [package]
-name = "avro-derive"
+name = "mz-avro-derive"
 version = "0.0.0"
 authors = ["Brennan Vincent <brennan@umanwizard.com>"]
 license = "Apache-2.0"
 edition = "2021"
+rust-version = "1.58.0"
 
 [lib]
 proc-macro = true
 
 [dependencies]
-proc-macro2 = "1.0.35"
-quote = "1.0.10"
-syn = { version = "1.0.83", features = ["full"] }
+proc-macro2 = "1.0.36"
+quote = "1.0.15"
+syn = { version = "1.0.86", features = ["full"] }
