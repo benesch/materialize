@@ -1971,7 +1971,7 @@ dependencies = [
  "indexmap",
  "slab",
  "tokio",
- "tokio-util",
+ "tokio-util 0.6.9",
  "tracing",
 ]
 
@@ -2817,7 +2817,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-native-tls",
- "tokio-util",
+ "tokio-util 0.6.9",
  "twox-hash",
  "url",
  "uuid",
@@ -3097,7 +3097,7 @@ dependencies = [
  "timely",
  "tokio",
  "tokio-postgres",
- "tokio-util",
+ "tokio-util 0.7.1",
  "tracing",
  "url",
  "uuid",
@@ -3167,7 +3167,7 @@ dependencies = [
  "timely",
  "tokio",
  "tokio-serde",
- "tokio-util",
+ "tokio-util 0.7.1",
  "tracing",
  "tracing-subscriber",
 ]
@@ -3563,7 +3563,7 @@ dependencies = [
  "tokio",
  "tokio-openssl",
  "tokio-stream",
- "tokio-util",
+ "tokio-util 0.7.1",
  "tracing",
 ]
 
@@ -3865,7 +3865,7 @@ dependencies = [
  "tokio",
  "tokio-postgres",
  "tokio-stream",
- "tokio-util",
+ "tokio-util 0.7.1",
  "url",
  "uuid",
  "walkdir",
@@ -5814,7 +5814,7 @@ dependencies = [
  "postgres-types",
  "socket2",
  "tokio",
- "tokio-util",
+ "tokio-util 0.6.9",
 ]
 
 [[package]]
@@ -5851,11 +5851,25 @@ checksum = "9e99e1983e5d376cd8eb4b66604d2e99e79f5bd988c3055891dcd8c9e2604cc0"
 dependencies = [
  "bytes",
  "futures-core",
- "futures-io",
  "futures-sink",
  "log",
  "pin-project-lite",
  "tokio",
+]
+
+[[package]]
+name = "tokio-util"
+version = "0.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0edfdeb067411dba2044da6d1cb2df793dd35add7888d73c16e3381ded401764"
+dependencies = [
+ "bytes",
+ "futures-core",
+ "futures-io",
+ "futures-sink",
+ "pin-project-lite",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -5890,7 +5904,7 @@ dependencies = [
  "prost-derive",
  "tokio",
  "tokio-stream",
- "tokio-util",
+ "tokio-util 0.6.9",
  "tower",
  "tower-layer",
  "tower-service",
@@ -5925,7 +5939,7 @@ dependencies = [
  "slab",
  "tokio",
  "tokio-stream",
- "tokio-util",
+ "tokio-util 0.6.9",
  "tower-layer",
  "tower-service",
  "tracing",
