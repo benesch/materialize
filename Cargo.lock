@@ -108,7 +108,7 @@ dependencies = [
  "futures",
  "hash_hasher",
  "num-traits",
- "parquet2",
+ "parquet2 0.8.1",
  "simdutf8",
 ]
 
@@ -3473,7 +3473,7 @@ dependencies = [
  "mz-build-info",
  "mz-ore",
  "mz-persist-types",
- "parquet2",
+ "parquet2 0.13.2",
  "prost",
  "prost-build",
  "rand",
@@ -4260,6 +4260,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "parquet-format-async-temp"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "488c8b5f43521d019fade4bcc0ce88cce5da5fd26eb1d38b933807041f5930bf"
+dependencies = [
+ "async-trait",
+ "futures",
+ "integer-encoding",
+]
+
+[[package]]
 name = "parquet2"
 version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4268,7 +4279,20 @@ dependencies = [
  "async-stream",
  "bitpacking",
  "futures",
- "parquet-format-async-temp",
+ "parquet-format-async-temp 0.2.0",
+ "streaming-decompression",
+]
+
+[[package]]
+name = "parquet2"
+version = "0.13.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "73fd2690ad041f9296876daef1f2706f6347073bdbcc719090887f1691e4a09d"
+dependencies = [
+ "async-stream",
+ "bitpacking",
+ "futures",
+ "parquet-format-async-temp 0.3.0",
  "streaming-decompression",
 ]
 
