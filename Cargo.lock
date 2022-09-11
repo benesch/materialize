@@ -108,7 +108,7 @@ dependencies = [
  "futures",
  "hash_hasher",
  "num-traits",
- "parquet2",
+ "parquet2 0.8.1",
  "simdutf8",
 ]
 
@@ -3473,7 +3473,7 @@ dependencies = [
  "mz-build-info",
  "mz-ore",
  "mz-persist-types",
- "parquet2",
+ "parquet2 0.16.3",
  "prost",
  "prost-build",
  "rand",
@@ -4260,6 +4260,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "parquet-format-safe"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1131c54b167dd4e4799ce762e1ab01549ebb94d5bdd13e6ec1b467491c378e1f"
+
+[[package]]
 name = "parquet2"
 version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4269,6 +4275,17 @@ dependencies = [
  "bitpacking",
  "futures",
  "parquet-format-async-temp",
+ "streaming-decompression",
+]
+
+[[package]]
+name = "parquet2"
+version = "0.16.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7752b1a7d61b278f36820ba05557a2a8bfcb17f3559254577ef447beda0c4975"
+dependencies = [
+ "parquet-format-safe",
+ "seq-macro",
  "streaming-decompression",
 ]
 
@@ -5181,6 +5198,12 @@ name = "semver"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0486718e92ec9a68fbed73bb5ef687d71103b142595b406835649bebd33f72c7"
+
+[[package]]
+name = "seq-macro"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0772c5c30e1a0d91f6834f8e545c69281c099dfa9a3ac58d96a9fd629c8d4898"
 
 [[package]]
 name = "serde"
