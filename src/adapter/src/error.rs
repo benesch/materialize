@@ -49,6 +49,9 @@ pub enum AdapterError {
     /// An error occurred while planning the statement.
     Explain(ExplainError),
     /// The specified parameter is fixed to a single specific value.
+    ///
+    /// We allow setting the parameter to its fixed value for compatibility
+    /// with PostgreSQL-based tools.
     FixedValueParameter(&'static (dyn Var + Send + Sync)),
     /// The ID allocator exhausted all valid IDs.
     IdExhaustionError,

@@ -446,8 +446,6 @@ impl SessionVars {
         if name == APPLICATION_NAME.name {
             self.application_name.set(value, local)
         } else if name == CLIENT_ENCODING.name {
-            // Unfortunately, some orm's like Prisma set NAMES to UTF8, thats the only
-            // value we support, so we let is through
             if UncasedStr::new(value) != CLIENT_ENCODING.value {
                 Err(AdapterError::FixedValueParameter(&CLIENT_ENCODING))
             } else {
@@ -511,7 +509,6 @@ impl SessionVars {
         } else if name == INTEGER_DATETIMES.name {
             Err(AdapterError::ReadOnlyParameter(&INTEGER_DATETIMES))
         } else if name == INTERVAL_STYLE.name {
-            // Only `postgres` is supported right now
             if UncasedStr::new(value) != INTERVAL_STYLE.value {
                 Err(AdapterError::FixedValueParameter(&INTERVAL_STYLE))
             } else {
