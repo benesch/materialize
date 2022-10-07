@@ -35,6 +35,7 @@ use mz_expr::{
     permutation_for_arrangement, CollectionPlan, MirRelationExpr, MirScalarExpr,
     OptimizedMirRelationExpr, RowSetFinishing,
 };
+use mz_ore::collections::CollectionExt;
 use mz_ore::ssh_key::SshKeyset;
 use mz_ore::task;
 use mz_repr::adt::interval::Interval;
@@ -54,7 +55,7 @@ use mz_sql::plan::{
     ExplainPlanNew, ExplainPlanOld, FetchPlan, HirRelationExpr, IndexOption, InsertPlan,
     MaterializedView, MutationKind, OptimizerConfig, PeekPlan, Plan, PlanKind, QueryWhen,
     RaisePlan, ReadThenWritePlan, ResetVariablePlan, RotateKeysPlan, SendDiffsPlan,
-    SetVariablePlan, ShowVariablePlan, SubscribeFrom, SubscribePlan, View,
+    SetVariablePlan, ShowVariablePlan, SubscribeFrom, SubscribePlan, View, VariableValue,
 };
 use mz_stash::Append;
 use mz_storage::controller::{CollectionDescription, DataSource, ReadPolicy, StorageError};
@@ -1800,10 +1801,8 @@ impl<S: Append + 'static> Coordinator<S> {
         let vars = session.vars_mut();
         let (name, local) = (plan.name, plan.local);
         match plan.value {
-            SetVariableValue::Literal(Value::String(s)) => vars.set(&name, &s, local)?,
-            SetVariableValue::Literal(lit) => vars.set(&name, &lit.to_string(), local)?,
-            SetVariableValue::Ident(ident) => vars.set(&name, &ident.into_string(), local)?,
-            SetVariableValue::Default => vars.reset(&name, local)?,
+            VariableValue::List(values) => vars.set(&name, &values, local)?,
+            VariableValue::Default => vars.reset(&name, local)?,
         }
 
         Ok(ExecuteResponse::SetVariable { name, tag: "SET" })
@@ -3373,21 +3372,16 @@ impl<S: Append + 'static> Coordinator<S> {
         AlterSystemSetPlan { name, value }: AlterSystemSetPlan,
     ) -> Result<ExecuteResponse, AdapterError> {
         self.is_user_allowed_to_alter_system(session)?;
-        use mz_sql::ast::{SetVariableValue, Value};
         let update_max_result_size = name == session::vars::MAX_RESULT_SIZE.name();
         let op = match value {
-            SetVariableValue::Literal(Value::String(value)) => {
+            VariableValue::List(values) => {
+                if values.len() != 1 {
+                    coord_bail!("ALTER SYSTEM ... SET takes only one argument");
+                }
+                let value = values.into_element();
                 catalog::Op::UpdateSystemConfiguration { name, value }
             }
-            SetVariableValue::Literal(value) => catalog::Op::UpdateSystemConfiguration {
-                name,
-                value: value.to_string(),
-            },
-            SetVariableValue::Ident(value) => catalog::Op::UpdateSystemConfiguration {
-                name,
-                value: value.to_string(),
-            },
-            SetVariableValue::Default => catalog::Op::ResetSystemConfiguration { name },
+            VariableValue::Default => catalog::Op::ResetSystemConfiguration { name },
         };
         self.catalog_transact(Some(session), vec![op], |_| Ok(()))
             .await?;

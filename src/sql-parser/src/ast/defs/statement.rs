@@ -1605,7 +1605,7 @@ impl_display!(DropClusterReplicasStatement);
 pub struct SetVariableStatement {
     pub local: bool,
     pub variable: Ident,
-    pub value: SetVariableValue,
+    pub to: SetVariableTo,
 }
 
 impl AstDisplay for SetVariableStatement {
@@ -1616,7 +1616,7 @@ impl AstDisplay for SetVariableStatement {
         }
         f.write_node(&self.variable);
         f.write_str(" = ");
-        f.write_node(&self.value);
+        f.write_node(&self.to);
     }
 }
 impl_display!(SetVariableStatement);
@@ -2269,10 +2269,26 @@ impl AstDisplay for TransactionIsolationLevel {
 impl_display!(TransactionIsolationLevel);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum SetVariableTo {
+    Default,
+    Values(Vec<SetVariableValue>),
+}
+
+impl AstDisplay for SetVariableTo {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
+        use SetVariableTo::*;
+        match self {
+            Values(values) => f.write_node(&display::comma_separated(values)),
+            Default => f.write_str("DEFAULT"),
+        }
+    }
+}
+impl_display!(SetVariableTo);
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum SetVariableValue {
     Ident(Ident),
     Literal(Value),
-    Default,
 }
 
 impl AstDisplay for SetVariableValue {
@@ -2281,7 +2297,6 @@ impl AstDisplay for SetVariableValue {
         match self {
             Ident(ident) => f.write_node(ident),
             Literal(literal) => f.write_node(literal),
-            Default => f.write_str("DEFAULT"),
         }
     }
 }
@@ -2637,7 +2652,7 @@ impl_display!(NoticeSeverity);
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct AlterSystemSetStatement {
     pub name: Ident,
-    pub value: SetVariableValue,
+    pub to: SetVariableTo,
 }
 
 impl AstDisplay for AlterSystemSetStatement {
@@ -2645,7 +2660,7 @@ impl AstDisplay for AlterSystemSetStatement {
         f.write_str("ALTER SYSTEM SET ");
         f.write_node(&self.name);
         f.write_str(" = ");
-        f.write_node(&self.value);
+        f.write_node(&self.to);
     }
 }
 impl_display!(AlterSystemSetStatement);

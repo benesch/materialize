@@ -442,33 +442,32 @@ impl SessionVars {
     /// insensitively. If `value` is not valid, as determined by the underlying
     /// configuration parameter, or if the named configuration parameter does
     /// not exist, an error is returned.
-    pub fn set(&mut self, name: &str, value: &str, local: bool) -> Result<(), AdapterError> {
+    pub fn set(&mut self, name: &str, values: &[String], local: bool) -> Result<(), AdapterError> {
         if name == APPLICATION_NAME.name {
-            self.application_name.set(value, local)
+            self.application_name.set(values, local)
         } else if name == CLIENT_ENCODING.name {
-            if UncasedStr::new(value) != CLIENT_ENCODING.value {
-                Err(AdapterError::FixedValueParameter(&CLIENT_ENCODING))
-            } else {
-                Ok(())
+            match assert_single_value(values) {
+                Ok(value) if UncasedStr::new(value) == CLIENT_ENCODING.value => (),
+                _ => Err(AdapterError::FixedValueParameter(&CLIENT_ENCODING)),
             }
         } else if name == CLIENT_MIN_MESSAGES.name {
-            if let Ok(_) = ClientSeverity::parse(value) {
-                self.client_min_messages.set(value, local)
+            if let Ok(_) = ClientSeverity::parse(values) {
+                self.client_min_messages.set(values, local)
             } else {
                 return Err(AdapterError::ConstrainedParameter {
                     parameter: &CLIENT_MIN_MESSAGES,
-                    value: value.into(),
+                    values: values.into(),
                     valid_values: Some(ClientSeverity::valid_values()),
                 });
             }
         } else if name == CLUSTER.name {
-            self.cluster.set(value, local)
+            self.cluster.set(values, local)
         } else if name == CLUSTER_REPLICA.name {
-            self.cluster_replica.set(value, local)
+            self.cluster_replica.set(values, local)
         } else if name == DATABASE.name {
-            self.database.set(value, local)
+            self.database.set(values, local)
         } else if name == DATE_STYLE.name {
-            for value in value.split(',') {
+            for value in values.iter().map(|v| v.split(',')) {
                 let value = UncasedStr::new(value.trim());
                 if value != "ISO" && value != "MDY" {
                     return Err(AdapterError::FixedValueParameter(&DATE_STYLE));
@@ -476,7 +475,7 @@ impl SessionVars {
             }
             Ok(())
         } else if name == EXTRA_FLOAT_DIGITS.name {
-            self.extra_float_digits.set(value, local)
+            self.extra_float_digits.set(values, local)
         } else if name == FAILPOINTS.name {
             for mut cfg in value.trim().split(';') {
                 cfg = cfg.trim();
@@ -525,7 +524,7 @@ impl SessionVars {
         } else if name == SQL_SAFE_UPDATES.name {
             self.sql_safe_updates.set(value, local)
         } else if name == STANDARD_CONFORMING_STRINGS.name {
-            match bool::parse(value) {
+            match assert_single_value(values).and_then(bool::parse) {
                 Ok(value) if value == *STANDARD_CONFORMING_STRINGS.value => Ok(()),
                 Ok(_) => Err(AdapterError::FixedValueParameter(
                     &STANDARD_CONFORMING_STRINGS,
@@ -535,24 +534,24 @@ impl SessionVars {
                 )),
             }
         } else if name == STATEMENT_TIMEOUT.name {
-            self.statement_timeout.set(value, local)
+            self.statement_timeout.set(values, local)
         } else if name == TIMEZONE.name {
-            if let Ok(_) = TimeZone::parse(value) {
-                self.timezone.set(value, local)
+            if let Ok(_) = TimeZone::parse(values) {
+                self.timezone.set(values, local)
             } else {
                 Err(AdapterError::ConstrainedParameter {
                     parameter: &TIMEZONE,
-                    value: value.into(),
+                    values: values.into(),
                     valid_values: None,
                 })
             }
         } else if name == TRANSACTION_ISOLATION.name {
-            if let Ok(_) = IsolationLevel::parse(value) {
-                self.transaction_isolation.set(value, local)
+            if let Ok(_) = IsolationLevel::parse(values) {
+                self.transaction_isolation.set(values, local)
             } else {
                 return Err(AdapterError::ConstrainedParameter {
                     parameter: &TRANSACTION_ISOLATION,
-                    value: value.into(),
+                    values: values.into(),
                     valid_values: Some(IsolationLevel::valid_values()),
                 });
             }
@@ -1136,7 +1135,7 @@ where
         }
     }
 
-    fn set(&mut self, s: &str, local: bool) -> Result<(), AdapterError> {
+    fn set(&mut self, s: &[String], local: bool) -> Result<(), AdapterError> {
         match V::parse(s) {
             Ok(v) => {
                 if local {
@@ -1207,16 +1206,24 @@ where
 pub trait Value: ToOwned + Send + Sync {
     /// The name of the value type.
     const TYPE_NAME: &'static str;
-    /// Parses a value of this type from a string.
-    fn parse(s: &str) -> Result<Self::Owned, ()>;
+    /// Parses a value of this type from a list of strings.
+    fn parse(values: &str) -> Result<Self::Owned, ()>;
     /// Formats this value as a string.
     fn format(&self) -> String;
+}
+
+fn assert_single_value(values: &[String]) -> Result<Self, ()> {
+    match values {
+        [value] => Ok(value),
+        _ => Err(()),
+    }
 }
 
 impl Value for bool {
     const TYPE_NAME: &'static str = "boolean";
 
-    fn parse(s: &str) -> Result<Self, ()> {
+    fn parse(values: &[String]) -> Result<Self, ()> {
+        let s = assert_single_value(values)?;
         match s {
             "t" | "true" | "on" => Ok(true),
             "f" | "false" | "off" => Ok(false),
@@ -1235,7 +1242,8 @@ impl Value for bool {
 impl Value for i32 {
     const TYPE_NAME: &'static str = "integer";
 
-    fn parse(s: &str) -> Result<i32, ()> {
+    fn parse(values: &[String]) -> Result<i32, ()> {
+        let s = assert_single_value(values)?;
         s.parse().map_err(|_| ())
     }
 
@@ -1247,7 +1255,8 @@ impl Value for i32 {
 impl Value for u32 {
     const TYPE_NAME: &'static str = "unsigned integer";
 
-    fn parse(s: &str) -> Result<u32, ()> {
+    fn parse(values: &[String]) -> Result<u32, ()> {
+        let s = assert_single_value(values)?;
         s.parse().map_err(|_| ())
     }
 
@@ -1264,8 +1273,8 @@ const MICRO_TO_MILLI: u32 = 1000u32;
 impl Value for Duration {
     const TYPE_NAME: &'static str = "duration";
 
-    fn parse(s: &str) -> Result<Duration, ()> {
-        let s = s.trim();
+    fn parse(values: &[String]) -> Result<Duration, ()> {
+        let s = assert_single_value(values)?.trim();
         // Take all numeric values from [0..]
         let split_pos = s
             .chars()
@@ -1568,8 +1577,8 @@ impl TimeZone {
 impl Value for TimeZone {
     const TYPE_NAME: &'static str = "string";
 
-    fn parse(s: &str) -> Result<Self::Owned, ()> {
-        let s = UncasedStr::new(s);
+    fn parse(values: &[String]) -> Result<Self::Owned, ()> {
+        let s = UncasedStr::new(assert_single_value(values)?);
 
         if s == TimeZone::UTC.as_str() {
             Ok(TimeZone::UTC)
@@ -1620,8 +1629,8 @@ impl IsolationLevel {
 impl Value for IsolationLevel {
     const TYPE_NAME: &'static str = "string";
 
-    fn parse(s: &str) -> Result<Self::Owned, ()> {
-        let s = UncasedStr::new(s);
+    fn parse(values: &[String]) -> Result<Self::Owned, ()> {
+        let s = UncasedStr::new(assert_single_value(values)?);
 
         // We don't have any optimizations for levels below Serializable,
         // so we upgrade them all to Serializable.

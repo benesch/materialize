@@ -39,7 +39,7 @@ pub enum AdapterError {
     /// The specified session parameter is constrained to a finite set of values.
     ConstrainedParameter {
         parameter: &'static (dyn Var + Send + Sync),
-        value: String,
+        values: Vec<String>,
         valid_values: Option<Vec<&'static str>>,
     },
     /// The cursor already exists.

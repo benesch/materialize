@@ -3496,10 +3496,10 @@ impl<'a> Parser<'a> {
             SET => {
                 let name = self.parse_identifier()?;
                 self.expect_keyword_or_token(TO, &Token::Eq)?;
-                let value = self.parse_set_variable_value()?;
+                let to = self.parse_set_variable_to()?;
                 Ok(Statement::AlterSystemSet(AlterSystemSetStatement {
                     name,
-                    value,
+                    to,
                 }))
             }
             RESET => {
@@ -4487,11 +4487,11 @@ impl<'a> Parser<'a> {
             }
         }
         if normal {
-            let value = self.parse_set_variable_value()?;
+            let to = self.parse_set_variable_to()?;
             Ok(Statement::SetVariable(SetVariableStatement {
                 local: modifier == Some(LOCAL),
                 variable,
-                value,
+                to,
             }))
         } else if
         // SET TRANSACTION transaction_mode
@@ -4510,15 +4510,24 @@ impl<'a> Parser<'a> {
         }
     }
 
+    fn parse_set_variable_to(&mut self) -> Result<SetVariableTo, ParserError> {
+        if self.parse_keyword(DEFAULT) {
+            Ok(SetVariableTo::Default)
+        } else {
+            Ok(SetVariableTo::Values(
+                self.parse_comma_separated(Parser::parse_set_variable_value)?,
+            ))
+        }
+    }
+
     fn parse_set_variable_value(&mut self) -> Result<SetVariableValue, ParserError> {
-        let token = self.peek_token();
-        Ok(match (self.parse_value(), token) {
-            (Ok(value), _) => SetVariableValue::Literal(value),
-            (Err(_), Some(Token::Keyword(DEFAULT))) => SetVariableValue::Default,
-            (Err(_), Some(Token::Keyword(kw))) => SetVariableValue::Ident(kw.into_ident()),
-            (Err(_), Some(Token::Ident(id))) => SetVariableValue::Ident(Ident::new(id)),
-            (Err(_), other) => self.expected(self.peek_pos(), "variable value", other)?,
-        })
+        if let Some(value) = self.maybe_parse(Parser::parse_value) {
+            Ok(SetVariableValue::Literal(value))
+        } else if let Some(ident) = self.maybe_parse(Parser::parse_identifier) {
+            Ok(SetVariableValue::Ident(ident))
+        } else {
+            self.expected(self.peek_pos(), "variable value", self.peek_token())
+        }
     }
 
     fn parse_reset(&mut self) -> Result<Statement<Raw>, ParserError> {

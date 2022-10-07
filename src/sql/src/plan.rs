@@ -49,8 +49,7 @@ use mz_storage::types::sources::{SourceDesc, Timeline};
 
 use crate::ast::{
     ExplainOptions, ExplainStageNew, ExplainStageOld, Expr, FetchDirection, IndexOptionName,
-    NoticeSeverity, ObjectType, Raw, SetVariableValue, Statement, StatementKind,
-    TransactionAccessMode,
+    NoticeSeverity, ObjectType, Raw, Statement, StatementKind, TransactionAccessMode,
 };
 use crate::catalog::{CatalogType, IdReference};
 use crate::names::{
@@ -441,8 +440,14 @@ pub struct ShowVariablePlan {
 #[derive(Debug)]
 pub struct SetVariablePlan {
     pub name: String,
-    pub value: SetVariableValue,
+    pub value: VariableValue,
     pub local: bool,
+}
+
+#[derive(Debug)]
+pub enum VariableValue {
+    Default,
+    List(Vec<String>),
 }
 
 #[derive(Debug)]
@@ -587,7 +592,7 @@ pub struct AlterSecretPlan {
 #[derive(Debug)]
 pub struct AlterSystemSetPlan {
     pub name: String,
-    pub value: SetVariableValue,
+    pub value: VariableValue,
 }
 
 #[derive(Debug)]

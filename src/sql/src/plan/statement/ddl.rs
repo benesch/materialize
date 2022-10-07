@@ -38,7 +38,7 @@ use mz_sql_parser::ast::{
     AlterSourceAction, AlterSourceStatement, AlterSystemResetAllStatement,
     AlterSystemResetStatement, AlterSystemSetStatement, CreateTypeListOption,
     CreateTypeListOptionName, CreateTypeMapOption, CreateTypeMapOptionName, LoadGenerator,
-    SetVariableValue, SshConnectionOption,
+    SshConnectionOption,
 };
 use mz_storage::source::generator::as_generator;
 use mz_storage::types::connections::aws::{AwsAssumeRole, AwsConfig, AwsCredentials, SerdeUri};
@@ -97,7 +97,7 @@ use crate::plan::error::PlanError;
 use crate::plan::expr::ColumnRef;
 use crate::plan::query::{ExprContext, QueryLifetime};
 use crate::plan::scope::Scope;
-use crate::plan::statement::{StatementContext, StatementDesc};
+use crate::plan::statement::{scl, StatementContext, StatementDesc};
 use crate::plan::typeconv::{plan_cast, CastContext};
 use crate::plan::with_options::{self, OptionalInterval, TryFromValue};
 use crate::plan::{
@@ -3477,13 +3477,10 @@ pub fn describe_alter_system_set(
 
 pub fn plan_alter_system_set(
     _: &StatementContext,
-    AlterSystemSetStatement { name, value }: AlterSystemSetStatement,
+    AlterSystemSetStatement { name, to }: AlterSystemSetStatement,
 ) -> Result<Plan, PlanError> {
     let name = name.to_string();
-    if matches!(&value, SetVariableValue::Literal(value) if matches!(value, mz_sql_parser::ast::Value::Null))
-    {
-        sql_bail!("Unable to set system configuration '{}' to NULL", name)
-    }
+    let value = scl::plan_set_variable_to(to)?;
     Ok(Plan::AlterSystemSet(AlterSystemSetPlan { name, value }))
 }
 
