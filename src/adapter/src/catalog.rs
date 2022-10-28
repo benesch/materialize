@@ -1779,6 +1779,11 @@ impl CatalogEntry {
         self.item.source_desc(self.name())
     }
 
+    /// Reports whether this catalog entry is a connection.
+    pub fn is_connection(&self) -> bool {
+        matches!(self.item(), CatalogItem::Connection(_))
+    }
+
     /// Reports whether this catalog entry is a table.
     pub fn is_table(&self) -> bool {
         matches!(self.item(), CatalogItem::Table(_))
@@ -5016,6 +5021,11 @@ impl<S: Append> Catalog<S> {
 
     pub fn entries(&self) -> impl Iterator<Item = &CatalogEntry> {
         self.state.entry_by_id.values()
+    }
+
+    pub fn user_connections(&self) -> impl Iterator<Item = &CatalogEntry> {
+        self.entries()
+            .filter(|entry| entry.is_connection() && entry.id.is_user())
     }
 
     pub fn user_tables(&self) -> impl Iterator<Item = &CatalogEntry> {

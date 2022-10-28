@@ -135,9 +135,9 @@ impl<S: Append + 'static> Coordinator<S> {
                             mz_storage::types::connections::Connection::Ssh(_) => {
                                 secrets_to_drop.push(*id);
                             }
-                            // PrivateLink connections have an associated VpcEndpoint K8S resource
-                            // that should be dropped
-                            mz_storage::types::connections::Connection::AwsPrivateLink(_) => {
+                            // AWS PrivateLink connections have an associated
+                            // VpcEndpoint K8S resource that should be dropped
+                            mz_storage::types::connections::Connection::AwsPrivatelink(_) => {
                                 vpc_endpoints_to_drop.push(*id);
                             }
                             _ => (),
@@ -412,9 +412,7 @@ impl<S: Append + 'static> Coordinator<S> {
             if let Err(e) = self
                 .cloud_resource_controller
                 .as_ref()
-                .ok_or(AdapterError::Unsupported(
-                    "PrivateLink connections are only allowed in cloud.",
-                ))
+                .ok_or(AdapterError::Unsupported("AWS PrivateLink connections"))
                 .unwrap()
                 .delete_vpc_endpoint(vpc_endpoint)
                 .await
@@ -564,6 +562,7 @@ impl<S: Append + 'static> Coordinator<S> {
         ops: &Vec<catalog::Op>,
         conn_id: ConnectionId,
     ) -> Result<(), AdapterError> {
+        let mut new_aws_privatelink_connections = 0;
         let mut new_tables = 0;
         let mut new_sources = 0;
         let mut new_sinks = 0;
@@ -605,6 +604,12 @@ impl<S: Append + 'static> Coordinator<S> {
                         ))
                         .or_insert(0) += 1;
                     match item {
+                        CatalogItem::Connection(connection) => match connection.connection {
+                            mz_storage::types::connections::Connection::AwsPrivatelink(_) => {
+                                new_aws_privatelink_connections += 1;
+                            }
+                            _ => (),
+                        },
                         CatalogItem::Table(_) => {
                             new_tables += 1;
                         }
@@ -627,8 +632,7 @@ impl<S: Append + 'static> Coordinator<S> {
                         | CatalogItem::View(_)
                         | CatalogItem::Index(_)
                         | CatalogItem::Type(_)
-                        | CatalogItem::Func(_)
-                        | CatalogItem::Connection(_) => {}
+                        | CatalogItem::Func(_) => {}
                     }
                 }
                 Op::DropDatabase { .. } => {
@@ -655,6 +659,12 @@ impl<S: Append + 'static> Coordinator<S> {
                         ))
                         .or_insert(0) -= 1;
                     match entry.item() {
+                        CatalogItem::Connection(connection) => match connection.connection {
+                            mz_storage::types::connections::Connection::AwsPrivatelink(_) => {
+                                new_aws_privatelink_connections -= 1;
+                            }
+                            _ => (),
+                        },
                         CatalogItem::Table(_) => {
                             new_tables -= 1;
                         }
@@ -677,8 +687,7 @@ impl<S: Append + 'static> Coordinator<S> {
                         | CatalogItem::View(_)
                         | CatalogItem::Index(_)
                         | CatalogItem::Type(_)
-                        | CatalogItem::Func(_)
-                        | CatalogItem::Connection(_) => {}
+                        | CatalogItem::Func(_) => {}
                     }
                 }
                 Op::AlterSink { .. }
@@ -695,6 +704,20 @@ impl<S: Append + 'static> Coordinator<S> {
             }
         }
 
+        self.validate_resource_limit(
+            self.catalog
+                .user_connections()
+                .filter(|c| {
+                    matches!(
+                        c.connection().unwrap().connection,
+                        mz_storage::types::connections::Connection::AwsPrivatelink(_),
+                    )
+                })
+                .count(),
+            new_aws_privatelink_connections,
+            SystemVars::max_aws_privatelink_connections,
+            "AWS PrivateLink Connection",
+        )?;
         self.validate_resource_limit(
             self.catalog.user_tables().count(),
             new_tables,

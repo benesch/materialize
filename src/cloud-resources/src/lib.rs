@@ -7,7 +7,8 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
-//! Abstractions for management of PrivateLink VpcEndpoint objects
+//! Abstractions for management of cloud resources that have no equivalent when running
+//! locally, like AWS PrivateLink endpoints.
 
 use std::collections::HashSet;
 use std::fmt::Debug;
@@ -22,16 +23,16 @@ use crate::crd::vpc_endpoint::v1::VpcEndpointSpec;
 
 #[async_trait]
 pub trait CloudResourceController: Debug + Send + Sync {
-    /// Creates or updates the specified VpcEndpoint K8s object.
+    /// Creates or updates the specified `VpcEndpoint` Kubernetes object.
     async fn ensure_vpc_endpoint(
         &self,
         id: GlobalId,
         spec: VpcEndpointSpec,
     ) -> Result<(), anyhow::Error>;
 
-    /// Deletes the specified VpcEndpoint K8S object.
+    /// Deletes the specified `VpcEndpoint` Kubernetes object.
     async fn delete_vpc_endpoint(&self, id: GlobalId) -> Result<(), anyhow::Error>;
 
-    /// Lists existing VpcEndpoint K8S objects.
+    /// Lists existing `VpcEndpoint` Kubernetes objects.
     async fn list_vpc_endpoints(&self) -> Result<HashSet<GlobalId>, anyhow::Error>;
 }

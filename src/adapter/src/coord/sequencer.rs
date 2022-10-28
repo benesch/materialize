@@ -609,12 +609,10 @@ impl<S: Append + 'static> Coordinator<S> {
 
                 ssh.public_keys = Some(keyset.public_keys());
             }
-            mz_storage::types::connections::Connection::AwsPrivateLink(ref privatelink) => {
+            mz_storage::types::connections::Connection::AwsPrivatelink(ref privatelink) => {
                 self.cloud_resource_controller
                     .as_ref()
-                    .ok_or(AdapterError::Unsupported(
-                        "PrivateLink connections are only allowed in cloud.",
-                    ))?
+                    .ok_or(AdapterError::Unsupported("AWS PrivateLink connections"))?
                     .ensure_vpc_endpoint(
                         connection_gid,
                         VpcEndpointSpec {

@@ -674,7 +674,7 @@ impl<S: Append + 'static> Coordinator<S> {
                     );
                 }
                 CatalogItem::Connection(catalog_connection) => {
-                    if let mz_storage::types::connections::Connection::AwsPrivateLink(conn) =
+                    if let mz_storage::types::connections::Connection::AwsPrivatelink(conn) =
                         &catalog_connection.connection
                     {
                         privatelink_connections.insert(

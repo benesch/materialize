@@ -35,3 +35,31 @@ def test_create_privatelink_connection(mz: MaterializeApplication) -> None:
     )[0][0]
 
     exists(resource=f"vpcendpoint/connection-{connection_id}")
+
+
+def test_create_postgres_privatelink_connection(mz: MaterializeApplication) -> None:
+    mz.environmentd.sql(
+        dedent(
+            """\
+            CREATE CONNECTION kafkaconn TO KAFKA (
+            BROKERS (
+                'customer-hostname-1:9092' USING AWS PRIVATELINK privatelinkconn,
+                'customer-hostname-2:9092' USING AWS PRIVATELINK privatelinkconn (PORT 9093),
+                'customer-hostname-4:9094',
+            )
+            );
+            """
+        )
+    )
+    kafka_connection_id = mz.environmentd.sql_query(
+        "SELECT id FROM mz_connections WHERE name = 'kafkaconn'"
+    )[0][0]
+
+    res = mz.environmentd.sql_query(
+        "SELECT * FROM mz_connections WHERE name = 'kafkaconn'"
+    )
+
+    print("cara: ")
+    print(res)
+
+    exists(resource=f"vpcendpoint/connection-{kafka_connection_id}")
