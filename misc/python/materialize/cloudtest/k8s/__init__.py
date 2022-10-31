@@ -105,7 +105,7 @@ class K8sService(K8sResource):
             body=self.service, namespace=self.namespace()
         )
 
-    def node_port(self) -> int:
+    def node_port(self, name=None) -> int:
         assert self.service and self.service.metadata and self.service.metadata.name
         service = self.api().read_namespaced_service(
             self.service.metadata.name, self.namespace()
@@ -118,34 +118,45 @@ class K8sService(K8sResource):
         ports = spec.ports
         assert ports is not None and len(ports) > 0
 
-        port = ports[0]
+        port = None
+        if name is None:
+            port = ports[0]
+        else:
+            for p in ports:
+                if p.name == name:
+                    port = p
+                    break
+        assert port is not None
+
         node_port = port.node_port
         assert node_port is not None
 
         return node_port
 
-    def sql_conn(self) -> Connection:
+    def sql_conn(self, port_name=None, user="materialize") -> Connection:
         """Get a connection to run SQL queries against the service"""
         return pg8000.connect(
-            host="localhost", port=self.node_port(), user="materialize"
+            host="localhost",
+            port=self.node_port(name=port_name),
+            user=user,
         )
 
-    def sql_cursor(self) -> Cursor:
+    def sql_cursor(self, port_name=None, user="materialize") -> Cursor:
         """Get a cursor to run SQL queries against the service"""
-        conn = self.sql_conn()
+        conn = self.sql_conn(port_name=port_name, user=user)
         conn.autocommit = True
         return conn.cursor()
 
-    def sql(self, sql: str) -> None:
+    def sql(self, sql: str, port_name=None, user="materialize") -> None:
         """Run a batch of SQL statements against the service."""
-        with self.sql_cursor() as cursor:
+        with self.sql_cursor(port_name=port_name, user=user) as cursor:
             for statement in sqlparse.split(sql):
                 print(f"> {statement}")
                 cursor.execute(statement)
 
-    def sql_query(self, sql: str) -> Any:
+    def sql_query(self, sql: str, port_name=None, user="materialize") -> Any:
         """Execute a SQL query against the service and return results."""
-        with self.sql_cursor() as cursor:
+        with self.sql_cursor(port_name=port_name, user=user) as cursor:
             print(f"> {sql}")
             cursor.execute(sql)
             return cursor.fetchall()
