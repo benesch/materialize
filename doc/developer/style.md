@@ -3,6 +3,69 @@
 Following are the coding conventions that Materialize developers should strive
 to adhere to.
 
+## Prose
+
+As as general rule, you should make a editing pass on any written text that will
+be committed to the repository. This includes commit messages, code comments,
+and developer documentation.
+
+Comments and documentation are read more frequently than they are written. You
+should therefore optimize for the comprehension of future readers (which might
+be yourself!), rather than for the speed of your own writing.
+
+Here are some specific rules to follow:
+
+<details>
+  <summary>
+    Use proper grammar, including proper punctuation and capitalization.
+    Prefer complete sentences in all but the simplest of cases.
+  </summary>
+
+Here's an example of an acceptable sentence fragment:
+
+```rust
+let duration = Duration::from_secs(300); // 5 minutes
+```
+
+Using a complete sentence instead (e.g., "This duration is equal to five
+minutes.") would yield little to no additional clarity
+
+Here's an example of a sentence fragment that ought to be more polished:
+
+```rust
+// only need a few tries, happens semi-reliably
+let retry_config = Retry::default().max_tries(3);
+```
+
+This comment would be better with more detail and proper grammar:
+
+```rust
+// We've measured that 99.9% of operations succeed by the third try.
+// Cap retries accordingly. Better to fail the occasional request than to
+// block the main processing thread with a long retry loop.
+let retry_config = Retry::default().max_tries(3);
+```
+</details>
+
+<details>
+  <summary>Avoid ad-hoc abbreviations.</summary>
+</details>
+
+<details>
+  <summary>Minimize typos.</summary>
+</details>
+
+This is the minimum. User-facing documentation and blog posts are held to an
+even higher standard. Consult the DevEx team and the marketing team for details.
+
+### Comments
+
+Strive to explain the why rather than the what or the how.
+
+```
+
+```
+
 ## SQL style
 
 The PostgreSQL manual adheres to a consistent style for its SQL statements, and
