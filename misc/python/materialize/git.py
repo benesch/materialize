@@ -84,18 +84,24 @@ def expand_globs(root: Path, *specs: Union[Path, str]) -> Set[str]:
     return set(f for f in (diff_files + ls_files).split("\0") if f.strip() != "")
 
 
-def get_version_tags(*, fetch: bool = True) -> List[semver.version.Version]:
+def get_version_tags(
+    *, fetch: bool = True, prefix: str = "v"
+) -> List[semver.version.Version]:
     """List all the version-like tags in the repo
 
     Args:
         fetch: If false, don't automatically run `git fetch --tags`.
+        prefix: A prefix to strip from each tag before attempting to parse the
+            tag as a version.
     """
     if fetch:
         _fetch()
     tags = []
     for t in spawn.capture(["git", "tag"]).splitlines():
+        if not t.startswith(prefix):
+            continue
         try:
-            tags.append(semver.version.Version.parse(t.lstrip("v")))
+            tags.append(semver.version.Version.parse(t.removeprefix(prefix)))
         except ValueError as e:
             print(f"WARN: {e}", file=sys.stderr)
 
