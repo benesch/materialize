@@ -598,27 +598,17 @@ impl CsrConnection {
             }
             Tunnel::AwsPrivatelink(connection) => {
                 assert!(connection.port.is_none());
-
-                // `net::lookup_host` requires a port but the port will be ignored
-                // when passed to `resolve_to_addrs`. We use a dummy port that will
-                // be easy to spot in the logs to make it obvious if some component
-                // downstream incorrectly starts using this port.
-                const DUMMY_PORT: u16 = 11111;
-
-                // TODO: use types to enforce that the URL has a string hostname.
-                let host = self
-                    .url
-                    .host_str()
-                    .ok_or_else(|| anyhow!("url missing host"))?;
                 let privatelink_host = mz_cloud_resources::vpc_endpoint_host(
                     connection.connection_id,
                     connection.availability_zone.as_deref(),
                 );
-                let addrs: Vec<_> = net::lookup_host((privatelink_host, DUMMY_PORT))
-                    .await
-                    .context("resolving PrivateLink host")?
-                    .collect();
-                client_config = client_config.resolve_to_addrs(host, &addrs)
+                // TODO: use types to enforce that the URL is not a base.
+                let mut url = self.url.clone();
+                url.set_host(Some(&privatelink_host))
+                    .context("constructing PrivateLink proxy URL")?;
+                let proxy =
+                    mz_ccsr::Proxy::all(url).context("constructing PrivateLink proxy URL")?;
+                client_config = client_config.proxy(proxy);
             }
         }
 
