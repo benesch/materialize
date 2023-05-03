@@ -7,11 +7,11 @@
 # the Business Source License, use of this software will be governed
 # by the Apache License, Version 2.0.
 
-name: "Internal: Epic"
+name: "Internal: project tracker"
 description: >
   An entry point for a single initiative with pointers to engineering design and product specifications, and links to all related issues
-title: "[Epic] <epic name>"
-labels: Epic
+title: "[Tracker] <epic name>"
+labels: tracker
 body:
   - type: markdown
     attributes:
