@@ -9,6 +9,7 @@
 
 //! Provides tooling to handle `WITH` options.
 
+use mz_ore::str::StrExt;
 use mz_repr::adt::interval::Interval;
 use mz_repr::{strconv, GlobalId};
 use mz_sql_parser::ast::{KafkaBroker, ReplicaDefinition};
@@ -17,7 +18,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::ast::{AstInfo, IntervalValue, UnresolvedItemName, Value, WithOptionValue};
 use crate::names::{ResolvedDataType, ResolvedItemName};
-use crate::plan::{Aug, PlanError};
+use crate::plan::{Aug, CopyFormat, PlanError};
 
 pub trait TryFromValue<T>: Sized {
     fn try_from_value(v: T) -> Result<Self, PlanError>;
@@ -225,6 +226,30 @@ where
 {
     fn implied_value() -> Result<Self, PlanError> {
         sql_bail!("must provide a {} value", V::name())
+    }
+}
+
+impl TryFromValue<Value> for CopyFormat {
+    fn try_from_value(v: Value) -> Result<Self, PlanError> {
+        match v {
+            Value::String(v) => match v.as_str() {
+                "text" => Ok(CopyFormat::Text),
+                "csv" => Ok(CopyFormat::Csv),
+                "binary" => Ok(CopyFormat::Binary),
+                _ => sql_bail!("COPY format {} not recognized", v.quoted()),
+            },
+            _ => sql_bail!("cannot use value as string"),
+        }
+    }
+
+    fn name() -> String {
+        "COPY format".to_string()
+    }
+}
+
+impl ImpliedValue for CopyFormat {
+    fn implied_value() -> Result<Self, PlanError> {
+        sql_bail!("must provide a string value")
     }
 }
 

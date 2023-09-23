@@ -18,42 +18,42 @@ COPY t(a, b) FROM STDIN
 ----
 COPY t(a, b) FROM STDIN
 =>
-Copy(CopyStatement { relation: Table { name: Name(UnresolvedItemName([Ident("t")])), columns: [Ident("a"), Ident("b")] }, direction: From, target: Stdin, options: [] })
+Copy(CopyStatement { what: TableFromStdin { name: Name(UnresolvedItemName([Ident("t")])), columns: [Ident("a"), Ident("b")] }, options: [] })
 
 parse-statement
 COPY t FROM STDIN
 ----
 COPY t FROM STDIN
 =>
-Copy(CopyStatement { relation: Table { name: Name(UnresolvedItemName([Ident("t")])), columns: [] }, direction: From, target: Stdin, options: [] })
+Copy(CopyStatement { what: TableFromStdin { name: Name(UnresolvedItemName([Ident("t")])), columns: [] }, options: [] })
 
 parse-statement
 COPY (select 1) TO STDOUT
 ----
 COPY (SELECT 1) TO STDOUT
 =>
-Copy(CopyStatement { relation: Select(SelectStatement { query: Query { ctes: Simple([]), body: Select(Select { distinct: None, projection: [Expr { expr: Value(Number("1")), alias: None }], from: [], selection: None, group_by: [], having: None, options: [] }), order_by: [], limit: None, offset: None }, as_of: None }), direction: To, target: Stdout, options: [] })
+Copy(CopyStatement { what: SelectToStdout(SelectStatement { query: Query { ctes: Simple([]), body: Select(Select { distinct: None, projection: [Expr { expr: Value(Number("1")), alias: None }], from: [], selection: None, group_by: [], having: None, options: [] }), order_by: [], limit: None, offset: None }, as_of: None }), options: [] })
 
 parse-statement
 COPY (subscribe (SELECT 1)) TO STDOUT
 ----
 COPY (SUBSCRIBE (SELECT 1)) TO STDOUT
 =>
-Copy(CopyStatement { relation: Subscribe(SubscribeStatement { relation: Query(Query { ctes: Simple([]), body: Select(Select { distinct: None, projection: [Expr { expr: Value(Number("1")), alias: None }], from: [], selection: None, group_by: [], having: None, options: [] }), order_by: [], limit: None, offset: None }), options: [], as_of: None, up_to: None, output: Diffs }), direction: To, target: Stdout, options: [] })
+Copy(CopyStatement { what: SubscribeToStdout(SubscribeStatement { relation: Query(Query { ctes: Simple([]), body: Select(Select { distinct: None, projection: [Expr { expr: Value(Number("1")), alias: None }], from: [], selection: None, group_by: [], having: None, options: [] }), order_by: [], limit: None, offset: None }), options: [], as_of: None, up_to: None, output: Diffs }), options: [] })
 
 parse-statement
 COPY t(a, b) TO STDOUT
 ----
 COPY t(a, b) TO STDOUT
 =>
-Copy(CopyStatement { relation: Table { name: Name(UnresolvedItemName([Ident("t")])), columns: [Ident("a"), Ident("b")] }, direction: To, target: Stdout, options: [] })
+Copy(CopyStatement { what: TableToStdout { name: Name(UnresolvedItemName([Ident("t")])), columns: [Ident("a"), Ident("b")] }, options: [] })
 
 parse-statement
 COPY t TO STDOUT WITH (FORMAT TEXT)
 ----
 COPY t TO STDOUT WITH (FORMAT = text)
 =>
-Copy(CopyStatement { relation: Table { name: Name(UnresolvedItemName([Ident("t")])), columns: [] }, direction: To, target: Stdout, options: [CopyOption { name: Format, value: Some(Ident(Ident("text"))) }] })
+Copy(CopyStatement { what: TableToStdout { name: Name(UnresolvedItemName([Ident("t")])), columns: [] }, options: [CopyOption { name: Format, value: Some(Ident(Ident("text"))) }] })
 
 parse-statement roundtrip
 COPY t FROM STDIN WITH (FORMAT CSV, DELIMITER '|', NULL 'NULL', QUOTE '"', ESCAPE '\\', HEADER false, FORCE_QUOTE (a), FORCE_NULL (a), FORCE_NOT_NULL (a))
@@ -88,7 +88,7 @@ COPY t TO STDIN
 parse-statement
 COPY (select 1) FROM STDIN
 ----
-error: queries not allowed in COPY FROM
+error: Expected TO, found FROM
 COPY (select 1) FROM STDIN
                 ^
 

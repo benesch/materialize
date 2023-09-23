@@ -25,10 +25,9 @@ use mz_sql_parser::ast::{ExplainTimestampStatement, Expr, OrderByExpr, Subscribe
 
 use crate::ast::display::AstDisplay;
 use crate::ast::{
-    AstInfo, CopyDirection, CopyOption, CopyOptionName, CopyRelation, CopyStatement, CopyTarget,
-    DeleteStatement, ExplainPlanStatement, ExplainStage, Explainee, Ident, InsertStatement, Query,
-    SelectStatement, SubscribeOption, SubscribeOptionName, SubscribeRelation, SubscribeStatement,
-    UpdateStatement,
+    AstInfo, CopyOption, CopyOptionName, CopyStatement, CopyWhat, DeleteStatement,
+    ExplainPlanStatement, ExplainStage, Explainee, Ident, InsertStatement, Query, SelectStatement,
+    SubscribeOption, SubscribeOptionName, SubscribeRelation, SubscribeStatement, UpdateStatement,
 };
 use crate::catalog::CatalogItemType;
 use crate::names::{Aug, ResolvedItemName};
@@ -644,12 +643,14 @@ pub fn describe_table(
 
 pub fn describe_copy(
     scx: &StatementContext,
-    CopyStatement { relation, .. }: CopyStatement<Aug>,
+    CopyStatement { what, .. }: CopyStatement<Aug>,
 ) -> Result<StatementDesc, PlanError> {
-    Ok(match relation {
-        CopyRelation::Table { name, columns } => describe_table(scx, name, columns)?,
-        CopyRelation::Select(stmt) => describe_select(scx, stmt)?,
-        CopyRelation::Subscribe(stmt) => describe_subscribe(scx, stmt)?,
+    Ok(match what {
+        CopyWhat::TableToStdout { name, columns } => describe_table(scx, name, columns)?,
+        CopyWhat::SelectToStdout(stmt) => describe_select(scx, stmt)?,
+        CopyWhat::SubscribeToStdout(stmt) => describe_subscribe(scx, stmt)?,
+        // TODO(benesch): is this right? `COPY FROM` does not produce rows.
+        CopyWhat::TableFromStdin { name, columns } => describe_table(scx, name, columns)?,
     }
     .with_is_copy())
 }
@@ -658,7 +659,6 @@ fn plan_copy_from(
     scx: &StatementContext,
     table_name: ResolvedItemName,
     columns: Vec<Ident>,
-    format: CopyFormat,
     options: CopyOptionExtracted,
 ) -> Result<Plan, PlanError> {
     fn only_available_with_csv<T>(option: Option<T>, param: &str) -> Result<(), PlanError> {
@@ -680,7 +680,7 @@ fn plan_copy_from(
         }
     }
 
-    let params = match format {
+    let params = match options.format {
         CopyFormat::Text => {
             only_available_with_csv(options.quote, "quote")?;
             only_available_with_csv(options.escape, "escape")?;
@@ -731,7 +731,7 @@ fn plan_copy_from(
 
 generate_extracted_config!(
     CopyOption,
-    (Format, String, Default("text")),
+    (Format, CopyFormat, Default(CopyFormat::Text)),
     (Delimiter, String),
     (Null, String),
     (Escape, String),
@@ -742,22 +742,21 @@ generate_extracted_config!(
     (ForceNotNull, Vec<String>)
 );
 
+fn plan_copy_to_options(options: CopyOptionExtracted) -> Result<Option<CopyFormat>, PlanError> {
+    if options.delimiter.is_some() {
+        sql_bail!("COPY TO does not support DELIMITER option yet");
+    }
+    if options.null.is_some() {
+        sql_bail!("COPY TO does not support NULL option yet");
+    }
+    Ok(Some(options.format))
+}
+
 pub fn plan_copy(
     scx: &StatementContext,
-    CopyStatement {
-        relation,
-        direction,
-        target,
-        options,
-    }: CopyStatement<Aug>,
+    CopyStatement { what, options }: CopyStatement<Aug>,
 ) -> Result<Plan, PlanError> {
     let options = CopyOptionExtracted::try_from(options)?;
-    let format = match options.format.to_lowercase().as_str() {
-        "text" => CopyFormat::Text,
-        "csv" => CopyFormat::Csv,
-        "binary" => CopyFormat::Binary,
-        _ => sql_bail!("unknown FORMAT: {}", options.format),
-    };
     if options.force_quote.is_some() {
         bail_unsupported!("FORCE_QUOTE");
     }
@@ -767,28 +766,17 @@ pub fn plan_copy(
     if options.force_not_null.is_some() {
         bail_unsupported!("FORCE_NOT_NULL");
     }
-    if let CopyDirection::To = direction {
-        if options.delimiter.is_some() {
-            sql_bail!("COPY TO does not support DELIMITER option yet");
+    match what {
+        CopyWhat::TableFromStdin { name, columns } => plan_copy_from(scx, name, columns, options),
+        CopyWhat::TableToStdout { .. } => bail_unsupported!("COPY TO table"),
+        CopyWhat::SelectToStdout(stmt) => Ok(plan_select(
+            scx,
+            stmt,
+            &Params::empty(),
+            plan_copy_to_options(options)?,
+        )?),
+        CopyWhat::SubscribeToStdout(stmt) => {
+            Ok(plan_subscribe(scx, stmt, plan_copy_to_options(options)?)?)
         }
-        if options.null.is_some() {
-            sql_bail!("COPY TO does not support NULL option yet");
-        }
-    }
-    match (&direction, &target) {
-        (CopyDirection::To, CopyTarget::Stdout) => match relation {
-            CopyRelation::Table { .. } => sql_bail!("table with COPY TO unsupported"),
-            CopyRelation::Select(stmt) => {
-                Ok(plan_select(scx, stmt, &Params::empty(), Some(format))?)
-            }
-            CopyRelation::Subscribe(stmt) => Ok(plan_subscribe(scx, stmt, Some(format))?),
-        },
-        (CopyDirection::From, CopyTarget::Stdin) => match relation {
-            CopyRelation::Table { name, columns } => {
-                plan_copy_from(scx, name, columns, format, options)
-            }
-            _ => sql_bail!("COPY FROM {} not supported", target),
-        },
-        _ => sql_bail!("COPY {} {} not supported", direction, target),
     }
 }

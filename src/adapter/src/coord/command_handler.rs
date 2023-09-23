@@ -18,7 +18,7 @@ use mz_ore::task;
 use mz_ore::tracing::OpenTelemetryContext;
 use mz_repr::role_id::RoleId;
 use mz_sql::ast::{
-    CopyRelation, CopyStatement, InsertSource, Query, Raw, SetExpr, Statement, SubscribeStatement,
+    CopyStatement, CopyWhat, InsertSource, Query, Raw, SetExpr, Statement, SubscribeStatement,
 };
 use mz_sql::catalog::RoleAttributes;
 use mz_sql::names::{PartialItemName, ResolvedIds};
@@ -406,7 +406,7 @@ impl Coordinator {
         match &stmt {
             Statement::Subscribe(SubscribeStatement { output, .. })
             | Statement::Copy(CopyStatement {
-                relation: CopyRelation::Subscribe(SubscribeStatement { output, .. }),
+                what: CopyWhat::SubscribeToStdout(SubscribeStatement { output, .. }),
                 ..
             }) => {
                 self.metrics

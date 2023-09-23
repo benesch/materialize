@@ -294,46 +294,56 @@ impl<T: AstInfo> AstDisplay for InsertStatement<T> {
 impl_display_t!(InsertStatement);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum CopyRelation<T: AstInfo> {
-    Table {
+pub enum CopyWhat<T: AstInfo> {
+    TableFromStdin {
         name: T::ItemName,
         columns: Vec<Ident>,
     },
-    Select(SelectStatement<T>),
-    Subscribe(SubscribeStatement<T>),
+    TableToStdout {
+        name: T::ItemName,
+        columns: Vec<Ident>,
+    },
+    SelectToStdout(SelectStatement<T>),
+    SubscribeToStdout(SubscribeStatement<T>),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum CopyDirection {
-    To,
-    From,
-}
-
-impl AstDisplay for CopyDirection {
+impl<T: AstInfo> AstDisplay for CopyWhat<T> {
     fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
-        f.write_str(match self {
-            CopyDirection::To => "TO",
-            CopyDirection::From => "FROM",
-        })
+        match self {
+            CopyWhat::TableFromStdin { name, columns } => {
+                f.write_node(name);
+                if !columns.is_empty() {
+                    f.write_str("(");
+                    f.write_node(&display::comma_separated(columns));
+                    f.write_str(")");
+                }
+                f.write_str(" FROM STDIN");
+            }
+            CopyWhat::TableToStdout { name, columns } => {
+                f.write_node(name);
+                if !columns.is_empty() {
+                    f.write_str("(");
+                    f.write_node(&display::comma_separated(columns));
+                    f.write_str(")");
+                }
+                f.write_str(" TO STDOUT");
+            }
+            CopyWhat::SelectToStdout(query) => {
+                f.write_str("(");
+                f.write_node(query);
+                f.write_str(")");
+                f.write_str(" TO STDOUT");
+            }
+            CopyWhat::SubscribeToStdout(query) => {
+                f.write_str("(");
+                f.write_node(query);
+                f.write_str(")");
+                f.write_str(" TO STDOUT");
+            }
+        };
     }
 }
-impl_display!(CopyDirection);
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum CopyTarget {
-    Stdin,
-    Stdout,
-}
-
-impl AstDisplay for CopyTarget {
-    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
-        f.write_str(match self {
-            CopyTarget::Stdin => "STDIN",
-            CopyTarget::Stdout => "STDOUT",
-        })
-    }
-}
-impl_display!(CopyTarget);
+impl_display_t!(CopyWhat);
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum CopyOptionName {
@@ -380,46 +390,19 @@ impl<T: AstInfo> AstDisplay for CopyOption<T> {
     }
 }
 
-/// `COPY`
+/// `COPY` statement.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CopyStatement<T: AstInfo> {
-    /// RELATION
-    pub relation: CopyRelation<T>,
-    /// DIRECTION
-    pub direction: CopyDirection,
-    // TARGET
-    pub target: CopyTarget,
-    // OPTIONS
+    /// Copy source and target.
+    pub what: CopyWhat<T>,
+    /// The options clause: `[WITH] (...)`.
     pub options: Vec<CopyOption<T>>,
 }
 
 impl<T: AstInfo> AstDisplay for CopyStatement<T> {
     fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
         f.write_str("COPY ");
-        match &self.relation {
-            CopyRelation::Table { name, columns } => {
-                f.write_node(name);
-                if !columns.is_empty() {
-                    f.write_str("(");
-                    f.write_node(&display::comma_separated(columns));
-                    f.write_str(")");
-                }
-            }
-            CopyRelation::Select(query) => {
-                f.write_str("(");
-                f.write_node(query);
-                f.write_str(")");
-            }
-            CopyRelation::Subscribe(query) => {
-                f.write_str("(");
-                f.write_node(query);
-                f.write_str(")");
-            }
-        };
-        f.write_str(" ");
-        f.write_node(&self.direction);
-        f.write_str(" ");
-        f.write_node(&self.target);
+        f.write_node(&self.what);
         if !self.options.is_empty() {
             f.write_str(" WITH (");
             f.write_node(&display::comma_separated(&self.options));

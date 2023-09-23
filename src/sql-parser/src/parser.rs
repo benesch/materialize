@@ -4878,38 +4878,30 @@ impl<'a> Parser<'a> {
 
     /// Parse a copy statement
     fn parse_copy(&mut self) -> Result<Statement<Raw>, ParserError> {
-        let relation = if self.consume_token(&Token::LParen) {
+        let what = if self.consume_token(&Token::LParen) {
             let stmt = self.parse_statement_inner()?;
             self.expect_token(&Token::RParen)?;
-            match stmt {
-                Statement::Select(stmt) => CopyRelation::Select(stmt),
-                Statement::Subscribe(stmt) => CopyRelation::Subscribe(stmt),
+            let what = match stmt {
+                Statement::Select(stmt) => CopyWhat::SelectToStdout(stmt),
+                Statement::Subscribe(stmt) => CopyWhat::SubscribeToStdout(stmt),
                 _ => return parser_err!(self, self.peek_prev_pos(), "unsupported query in COPY"),
-            }
+            };
+            self.expect_keywords(&[TO, STDOUT])?;
+            what
         } else {
             let name = self.parse_raw_name()?;
             let columns = self.parse_parenthesized_column_list(Optional)?;
-            CopyRelation::Table { name, columns }
-        };
-        let (direction, target) = match self.expect_one_of_keywords(&[FROM, TO])? {
-            FROM => {
-                if let CopyRelation::Table { .. } = relation {
-                    // Ok.
-                } else {
-                    return parser_err!(
-                        self,
-                        self.peek_prev_pos(),
-                        "queries not allowed in COPY FROM"
-                    );
+            match self.expect_one_of_keywords(&[FROM, TO])? {
+                FROM => {
+                    self.expect_keyword(STDIN)?;
+                    CopyWhat::TableFromStdin { name, columns }
                 }
-                self.expect_keyword(STDIN)?;
-                (CopyDirection::From, CopyTarget::Stdin)
+                TO => {
+                    self.expect_keyword(STDOUT)?;
+                    CopyWhat::TableToStdout { name, columns }
+                }
+                _ => unreachable!(),
             }
-            TO => {
-                self.expect_keyword(STDOUT)?;
-                (CopyDirection::To, CopyTarget::Stdout)
-            }
-            _ => unreachable!(),
         };
         // WITH must be followed by LParen. The WITH in COPY is optional for backward
         // compat with Postgres but is required elsewhere, which is why we don't use
@@ -4927,12 +4919,7 @@ impl<'a> Parser<'a> {
         } else {
             vec![]
         };
-        Ok(Statement::Copy(CopyStatement {
-            relation,
-            direction,
-            target,
-            options,
-        }))
+        Ok(Statement::Copy(CopyStatement { what, options }))
     }
 
     fn parse_copy_option(&mut self) -> Result<CopyOption<Raw>, ParserError> {
