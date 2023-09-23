@@ -12,12 +12,11 @@
 //! This module houses the handlers for statements that manipulate data, like
 //! `INSERT`, `SELECT`, `SUBSCRIBE`, and `COPY`.
 
-use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
 use itertools::Itertools;
 use mz_expr::MirRelationExpr;
-use mz_pgcopy::{CopyCsvFormatParams, CopyFormatParams, CopyTextFormatParams};
+use mz_pgcopy::{CopyCsvFormatParams, CopyFormatParams, CopyTextFormatParams, DEFAULT_COPY_TEXT_FORMAT_NULL, DEFAULT_COPY_CSV_FORMAT_NULL, DEFAULT_COPY_TEXT_FORMAT_DELIMITER, DEFAULT_COPY_CSV_FORMAT_DELIMITER, DEFAULT_COPY_CSV_FORMAT_QUOTE};
 use mz_repr::adt::numeric::NumericMaxScale;
 use mz_repr::explain::{ExplainConfig, ExplainFormat};
 use mz_repr::{RelationDesc, ScalarType};
@@ -668,13 +667,20 @@ fn plan_copy_from(
         }
     }
 
+    fn not_available_with_binary<T>(option: Option<T>, param: &str) -> Result<(), PlanError> {
+        match option {
+            Some(_) => sql_bail!("cannot specify {} in BINARY mode", param),
+            None => Ok(()),
+        }
+    }
+
     fn extract_byte_param_value(
         v: Option<String>,
         default: u8,
         param_name: &str,
     ) -> Result<u8, PlanError> {
-        match v {
-            Some(v) if v.len() == 1 => Ok(v.as_bytes()[0]),
+        match v.as_ref().map(String::as_bytes) {
+            Some([d]) => Ok(*d),
             Some(..) => sql_bail!("COPY {} must be a single one-byte character", param_name),
             None => Ok(default),
         }
@@ -685,31 +691,31 @@ fn plan_copy_from(
             only_available_with_csv(options.quote, "quote")?;
             only_available_with_csv(options.escape, "escape")?;
             only_available_with_csv(options.header, "HEADER")?;
-            let delimiter = match options.delimiter {
-                Some(delimiter) if delimiter.len() > 1 => {
-                    sql_bail!("COPY delimiter must be a single one-byte character");
-                }
-                Some(delimiter) => Cow::from(delimiter),
-                None => Cow::from("\t"),
-            };
-            let null = match options.null {
-                Some(null) => Cow::from(null),
-                None => Cow::from("\\N"),
-            };
+            let null = options.null.unwrap_or_else(|| DEFAULT_COPY_TEXT_FORMAT_NULL.into());
+            let delimiter = extract_byte_param_value(options.delimiter, DEFAULT_COPY_TEXT_FORMAT_DELIMITER, "delimiter")?;
+            only_available_with_csv(options.force_quote, "force quote")?;
+            only_available_with_csv(options.force_null, "force null")?;
+            only_available_with_csv(options.force_not_null, "force not null")?;
             CopyFormatParams::Text(CopyTextFormatParams { null, delimiter })
         }
         CopyFormat::Csv => {
-            let quote = extract_byte_param_value(options.quote, b'"', "quote")?;
+            let quote = extract_byte_param_value(options.quote, DEFAULT_COPY_CSV_FORMAT_QUOTE, "quote")?;
             let escape = extract_byte_param_value(options.escape, quote, "escape")?;
             let header = options.header.unwrap_or(false);
-            let delimiter = extract_byte_param_value(options.delimiter, b',', "delimiter")?;
+            let null = options.null.unwrap_or_else(|| DEFAULT_COPY_CSV_FORMAT_NULL.into());
+            let delimiter = extract_byte_param_value(options.delimiter, DEFAULT_COPY_CSV_FORMAT_DELIMITER, "delimiter")?;
+            if options.force_quote.is_some() {
+                sql_bail!("COPY force quote only available using COPY TO");
+            }
+            if options.force_null.is_some() {
+                bail_unsupported!("FORCE_NULL");
+            }
+            if options.force_not_null.is_some() {
+                bail_unsupported!("FORCE_NOT_NULL");
+            }
             if delimiter == quote {
                 sql_bail!("COPY delimiter and quote must be different");
             }
-            let null = match options.null {
-                Some(null) => Cow::from(null),
-                None => Cow::from(""),
-            };
             CopyFormatParams::Csv(CopyCsvFormatParams {
                 delimiter,
                 quote,
@@ -718,7 +724,17 @@ fn plan_copy_from(
                 header,
             })
         }
-        CopyFormat::Binary => bail_unsupported!("FORMAT BINARY"),
+        CopyFormat::Binary => {
+            only_available_with_csv(options.quote, "quote")?;
+            only_available_with_csv(options.escape, "escape")?;
+            only_available_with_csv(options.header, "HEADER")?;
+            not_available_with_binary(options.null, "NULL")?;
+            not_available_with_binary(options.delimiter, "DELIMITER")?;
+            only_available_with_csv(options.force_quote, "force quote")?;
+            only_available_with_csv(options.force_null, "force null")?;
+            only_available_with_csv(options.force_not_null, "force not null")?;
+            bail_unsupported!("FORMAT BINARY")
+        }
     };
 
     let (id, _, columns) = query::plan_copy_from(scx, table_name, columns)?;
@@ -749,14 +765,6 @@ fn plan_copy_to_options(options: CopyOptionExtracted) -> Result<Option<CopyForma
     if options.null.is_some() {
         sql_bail!("COPY TO does not support NULL option yet");
     }
-    Ok(Some(options.format))
-}
-
-pub fn plan_copy(
-    scx: &StatementContext,
-    CopyStatement { what, options }: CopyStatement<Aug>,
-) -> Result<Plan, PlanError> {
-    let options = CopyOptionExtracted::try_from(options)?;
     if options.force_quote.is_some() {
         bail_unsupported!("FORCE_QUOTE");
     }
@@ -766,6 +774,14 @@ pub fn plan_copy(
     if options.force_not_null.is_some() {
         bail_unsupported!("FORCE_NOT_NULL");
     }
+    Ok(Some(options.format))
+}
+
+pub fn plan_copy(
+    scx: &StatementContext,
+    CopyStatement { what, options }: CopyStatement<Aug>,
+) -> Result<Plan, PlanError> {
+    let options = CopyOptionExtracted::try_from(options)?;
     match what {
         CopyWhat::TableFromStdin { name, columns } => plan_copy_from(scx, name, columns, options),
         CopyWhat::TableToStdout { .. } => bail_unsupported!("COPY TO table"),

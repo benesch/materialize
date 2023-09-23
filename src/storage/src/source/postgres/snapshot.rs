@@ -139,6 +139,7 @@ use std::rc::Rc;
 
 use differential_dataflow::{AsCollection, Collection};
 use futures::TryStreamExt;
+use mz_pgcopy::{CopyTextFormatParser, CopyTextFormatParams};
 use timely::dataflow::channels::pact::Pipeline;
 use timely::dataflow::operators::{Broadcast, ConnectLoop, Feedback};
 use timely::dataflow::{Scope, Stream};
@@ -414,7 +415,8 @@ async fn use_snapshot(client: &Client, snapshot: &str) -> Result<(), TransientEr
 /// Decodes a row of `col_len` columns obtained from a text encoded COPY query into `row`.
 fn decode_copy_row(data: &[u8], col_len: usize, row: &mut Row) -> Result<(), DefiniteError> {
     let mut packer = row.packer();
-    let row_parser = mz_pgcopy::CopyTextFormatParser::new(data, "\t", "\\N");
+    let params = CopyTextFormatParams::default();
+    let row_parser = CopyTextFormatParser::new(&params, data);
     let mut column_iter = row_parser.iter_raw_truncating(col_len);
     for _ in 0..col_len {
         let value = match column_iter.next() {

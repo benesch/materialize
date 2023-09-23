@@ -468,7 +468,7 @@ pub enum ExecuteResponse {
     CopyFrom {
         id: GlobalId,
         columns: Vec<usize>,
-        params: CopyFormatParams<'static>,
+        params: CopyFormatParams,
         ctx_extra: ExecuteContextExtra,
     },
     /// The requested connection was created.

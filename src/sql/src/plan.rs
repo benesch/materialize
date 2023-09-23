@@ -799,7 +799,7 @@ pub struct ShowColumnsPlan {
 pub struct CopyFromPlan {
     pub id: GlobalId,
     pub columns: Vec<usize>,
-    pub params: CopyFormatParams<'static>,
+    pub params: CopyFormatParams,
 }
 
 #[derive(Clone, Debug)]

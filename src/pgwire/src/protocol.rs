@@ -2048,7 +2048,7 @@ where
         &mut self,
         id: GlobalId,
         columns: Vec<usize>,
-        params: CopyFormatParams<'_>,
+        params: CopyFormatParams,
         row_desc: RelationDesc,
         mut ctx_extra: ExecuteContextExtra,
     ) -> Result<State, io::Error> {
@@ -2082,7 +2082,7 @@ where
         &mut self,
         id: GlobalId,
         columns: Vec<usize>,
-        params: CopyFormatParams<'_>,
+        params: CopyFormatParams,
         row_desc: RelationDesc,
         ctx_extra: &mut ExecuteContextExtra,
     ) -> Result<State, io::Error> {
