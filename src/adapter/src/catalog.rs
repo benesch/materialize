@@ -787,7 +787,7 @@ impl CatalogState {
         // case during catalog rehydration in order to avoid panics.
         session_catalog.system_vars_mut().enable_all_feature_flags();
 
-        let stmt = mz_sql::parse::parse(&create_sql)?.into_element().ast;
+        let stmt = mz_sql::parse::parse(&create_sql)?.into_element().stmt;
         let (stmt, resolved_ids) = mz_sql::names::resolve(&session_catalog, stmt)?;
         let plan = mz_sql::plan::plan(
             None,
@@ -2630,7 +2630,7 @@ impl CatalogItem {
             let mut create_stmt = mz_sql::parse::parse(&create_sql)
                 .expect("invalid create sql persisted to catalog")
                 .into_element()
-                .ast;
+                .stmt;
             if rename_self {
                 mz_sql::ast::transform::create_stmt_rename(&mut create_stmt, to_item_name.clone());
             }
@@ -3328,7 +3328,7 @@ impl CatalogItemRebuilder {
             let mut create_stmt = mz_sql::parse::parse(&create_sql)
                 .expect("invalid create sql persisted to catalog")
                 .into_element()
-                .ast;
+                .stmt;
             mz_sql::ast::transform::create_stmt_replace_ids(&mut create_stmt, ancestor_ids);
             Self::Object {
                 id,
@@ -5801,7 +5801,7 @@ impl Catalog {
                     let mut stmt = mz_sql::parse::parse(&new_sink.create_sql)
                         .expect("invalid create sql persisted to catalog")
                         .into_element()
-                        .ast;
+                        .stmt;
 
                     let create_stmt = match &mut stmt {
                         Statement::CreateSink(s) => s,
@@ -5899,7 +5899,7 @@ impl Catalog {
                     let mut stmt = mz_sql::parse::parse(&new_source.create_sql)
                         .expect("invalid create sql persisted to catalog")
                         .into_element()
-                        .ast;
+                        .stmt;
 
                     let create_stmt = match &mut stmt {
                         Statement::CreateSource(s) => s,
@@ -7775,7 +7775,7 @@ impl Catalog {
         // case during catalog rehydration in order to avoid panics.
         session_catalog.system_vars_mut().enable_all_feature_flags();
 
-        let stmt = mz_sql::parse::parse(&create_sql)?.into_element().ast;
+        let stmt = mz_sql::parse::parse(&create_sql)?.into_element().stmt;
         let (stmt, resolved_ids) = mz_sql::names::resolve(&session_catalog, stmt)?;
         let plan =
             mz_sql::plan::plan(pcx, &session_catalog, stmt, &Params::empty(), &resolved_ids)?;
@@ -10177,7 +10177,7 @@ mod tests {
             )
             .expect("")
             .into_element()
-            .ast;
+            .stmt;
 
             let (stmt, _) = names::resolve(scx.catalog, parsed).expect("");
 

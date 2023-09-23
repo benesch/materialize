@@ -68,6 +68,7 @@
 //!
 //! use mz_sql_parser::ast::{AstInfo, Query, Raw};
 //! use mz_sql_parser::ast::visit::{self, Visit};
+//! use mz_sql_parser::parser::ParsedStatement;
 //!
 //! struct SubqueryCounter {
 //!     count: usize,
@@ -90,8 +91,8 @@
 //!     let stmts = mz_sql_parser::parser::parse_statements(sql.into())?;
 //!
 //!     let mut counter = SubqueryCounter { count: 0 };
-//!     for stmt in &stmts {
-//!         counter.visit_statement(&stmt.ast);
+//!     for ParsedStatement { stmt, .. } in &stmts {
+//!         counter.visit_statement(&stmt);
 //!     }
 //!     assert_eq!(counter.count, 5);
 //!     Ok(())
@@ -107,6 +108,7 @@
 //!
 //! use mz_sql_parser::ast::{Ident, Raw, AstInfo, RawItemName};
 //! use mz_sql_parser::ast::visit::{self, Visit};
+//! use mz_sql_parser::parser::ParsedStatement;
 //!
 //! struct IdentCollector<'ast> {
 //!     idents: Vec<&'ast Ident>,
@@ -134,8 +136,8 @@
 //!     let stmts = mz_sql_parser::parser::parse_statements(sql.into())?;
 //!
 //!     let mut collector = IdentCollector { idents: vec![] };
-//!     for stmt in &stmts {
-//!         collector.visit_statement(&stmt.ast);
+//!     for ParsedStatement { stmt, .. } in &stmts {
+//!         collector.visit_statement(&stmt);
 //!     }
 //!     assert_eq!(collector.idents, &[
 //!         &Ident::new("a"), &Ident::new("b"), &Ident::new("c"),

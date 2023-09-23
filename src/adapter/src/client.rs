@@ -32,7 +32,7 @@ use mz_sql::catalog::{EnvironmentId, SessionCatalog};
 use mz_sql::session::hint::ApplicationNameHint;
 use mz_sql::session::user::{User, SUPPORT_USER};
 use mz_sql::session::vars::VarInput;
-use mz_sql_parser::parser::{ParserStatementError, StatementParseResult};
+use mz_sql_parser::parser::{ParsedStatement, ParserStatementError};
 use mz_transform::Optimizer;
 use prometheus::Histogram;
 use serde_json::json;
@@ -251,7 +251,7 @@ impl Client {
         if stmts.len() != 1 {
             bail!("must supply exactly one query");
         }
-        let StatementParseResult { ast: stmt, sql } = stmts.into_element();
+        let ParsedStatement { stmt, sql } = stmts.into_element();
 
         const EMPTY_PORTAL: &str = "";
         session_client.start_transaction(Some(1))?;
@@ -333,7 +333,7 @@ impl SessionClient {
     pub fn parse<'a>(
         &self,
         sql: &'a str,
-    ) -> Result<Result<Vec<StatementParseResult<'a>>, ParserStatementError>, String> {
+    ) -> Result<Result<Vec<ParsedStatement<'a>>, ParserStatementError>, String> {
         match mz_sql::parse::parse_with_limit(sql) {
             Ok(Err(e)) => {
                 self.track_statement_parse_failure(&e);

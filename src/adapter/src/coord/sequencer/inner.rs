@@ -3968,7 +3968,7 @@ impl Coordinator {
             let create_source_stmt = match mz_sql::parse::parse(create_source_sql)
                 .expect("invalid create sql persisted to catalog")
                 .into_element()
-                .ast
+                .stmt
             {
                 Statement::CreateSource(stmt) => stmt,
                 _ => unreachable!("proved type is source"),

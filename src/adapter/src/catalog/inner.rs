@@ -74,7 +74,7 @@ impl Catalog {
             // TODO: Should never happen
             .expect("invalid create sql persisted to catalog")
             .into_element()
-            .ast;
+            .stmt;
 
         // Patch AST.
         let stmt_in_cluster = match &mut stmt {

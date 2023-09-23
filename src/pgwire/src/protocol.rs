@@ -33,7 +33,7 @@ use mz_pgcopy::CopyFormatParams;
 use mz_repr::{Datum, GlobalId, RelationDesc, RelationType, Row, RowArena, ScalarType};
 use mz_sql::ast::display::AstDisplay;
 use mz_sql::ast::{FetchDirection, Ident, Raw, Statement};
-use mz_sql::parse::StatementParseResult;
+use mz_sql::parse::ParsedStatement;
 use mz_sql::plan::{CopyFormat, ExecuteTimeout, StatementDesc};
 use mz_sql::session::user::{ExternalUserMetadata, User, INTERNAL_USER_NAMES};
 use mz_sql::session::vars::{ConnectionCounter, DropConnection, VarInput};
@@ -675,7 +675,7 @@ where
         assert!(res.is_ok());
     }
 
-    fn parse_sql<'b>(&self, sql: &'b str) -> Result<Vec<StatementParseResult<'b>>, ErrorResponse> {
+    fn parse_sql<'b>(&self, sql: &'b str) -> Result<Vec<ParsedStatement<'b>>, ErrorResponse> {
         match self.adapter_client.parse(sql) {
             Ok(result) => result.map_err(|e| {
                 // Convert our 0-based byte position to pgwire's 1-based character
@@ -703,7 +703,7 @@ where
         let num_stmts = stmts.len();
 
         // Compare with postgres' backend/tcop/postgres.c exec_simple_query.
-        for StatementParseResult { ast: stmt, sql } in stmts {
+        for ParsedStatement { stmt, sql } in stmts {
             // In an aborted transaction, reject all commands except COMMIT/ROLLBACK.
             if self.is_aborted_txn() && !is_txn_exit_stmt(Some(&stmt)) {
                 self.aborted_txn_error().await?;
@@ -791,7 +791,7 @@ where
         }
         let (maybe_stmt, sql) = match stmts.into_iter().next() {
             None => (None, ""),
-            Some(StatementParseResult { ast, sql }) => (Some(ast), sql),
+            Some(ParsedStatement { stmt, sql }) => (Some(stmt), sql),
         };
         if self.is_aborted_txn() && !is_txn_exit_stmt(maybe_stmt.as_ref()) {
             return self.aborted_txn_error().await;

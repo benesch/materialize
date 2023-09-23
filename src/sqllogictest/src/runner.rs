@@ -1264,7 +1264,7 @@ impl<'a> RunnerInner<'a> {
         };
         let statement = match &*statements {
             [] => bail!("Got zero statements?"),
-            [statement] => &statement.ast,
+            [statement] => &statement.stmt,
             _ => bail!("Got multiple statements: {:?}", statements),
         };
         let (is_select, num_attributes) = match statement {
@@ -2080,7 +2080,7 @@ fn generate_view_sql(
     // DDL cost drops dramatically in the future.
     let stmts = parser::parse_statements(sql).unwrap_or_default();
     assert!(stmts.len() == 1);
-    let (query, query_as_of) = match &stmts[0].ast {
+    let (query, query_as_of) = match &stmts[0].stmt {
         Statement::Select(stmt) => (&stmt.query, &stmt.as_of),
         _ => unreachable!("This function should only be called for SELECTs"),
     };
@@ -2361,7 +2361,7 @@ fn mutate(sql: &str) -> Vec<String> {
     let stmts = parser::parse_statements(sql).unwrap_or_default();
     let mut additional = Vec::new();
     for stmt in stmts {
-        match stmt.ast {
+        match stmt.stmt {
             AstStatement::CreateTable(stmt) => additional.push(
                 // CREATE TABLE -> CREATE INDEX. Specify all columns manually in case CREATE
                 // DEFAULT INDEX ever goes away.

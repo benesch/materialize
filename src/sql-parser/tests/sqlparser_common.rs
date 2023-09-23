@@ -131,10 +131,10 @@ fn datadriven() {
                 if s.len() != 1 {
                     return "expected exactly one statement\n".to_string();
                 }
-                let stmt = s.into_element().ast;
+                let stmt = s.into_element().stmt;
                 for printed in [stmt.to_ast_string(), stmt.to_ast_string_stable()] {
                     let mut parsed = match parser::parse_statements(&printed) {
-                        Ok(parsed) => parsed.into_element().ast,
+                        Ok(parsed) => parsed.into_element().stmt,
                         Err(err) => panic!("reparse failed: {}: {}\n", stmt, err),
                     };
                     match (&mut parsed, &stmt) {
@@ -389,7 +389,7 @@ fn test_basic_visitor() -> Result<(), Box<dyn Error>> {
         seen_idents: Vec::new(),
     };
     for stmt in &stmts {
-        Visit::visit_statement(&mut visitor, &stmt.ast);
+        Visit::visit_statement(&mut visitor, &stmt.stmt);
     }
     assert_eq!(visitor.seen_idents, expected);
 

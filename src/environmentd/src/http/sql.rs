@@ -34,7 +34,7 @@ use mz_ore::result::ResultExt;
 use mz_repr::{Datum, RelationDesc, RowArena};
 use mz_sql::ast::display::AstDisplay;
 use mz_sql::ast::{Raw, Statement, StatementKind};
-use mz_sql::parse::StatementParseResult;
+use mz_sql::parse::ParsedStatement;
 use mz_sql::plan::Plan;
 use serde::{Deserialize, Serialize};
 use tokio::{select, time};
@@ -818,7 +818,7 @@ async fn execute_request<S: ResultSender>(
     fn parse<'a>(
         client: &mut SessionClient,
         query: &'a str,
-    ) -> Result<Vec<StatementParseResult<'a>>, anyhow::Error> {
+    ) -> Result<Vec<ParsedStatement<'a>>, anyhow::Error> {
         match client.parse(query) {
             Ok(result) => result.map_err(|e| anyhow!(e.error)),
             Err(e) => Err(anyhow!(e)),
@@ -831,7 +831,7 @@ async fn execute_request<S: ResultSender>(
         SqlRequest::Simple { query } => {
             let stmts = parse(client, &query)?;
             let mut stmt_group = Vec::with_capacity(stmts.len());
-            for StatementParseResult { ast: stmt, sql } in stmts {
+            for ParsedStatement { stmt, sql } in stmts {
                 check_prohibited_stmts(sender, &stmt)?;
                 stmt_group.push((stmt, sql.to_string(), vec![]));
             }
@@ -848,7 +848,7 @@ async fn execute_request<S: ResultSender>(
                     );
                 }
 
-                let StatementParseResult { ast: stmt, sql } = stmts.pop().unwrap();
+                let ParsedStatement { stmt, sql } = stmts.pop().unwrap();
                 check_prohibited_stmts(sender, &stmt)?;
 
                 stmt_groups.push(vec![(stmt, sql.to_string(), params)]);

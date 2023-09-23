@@ -45,7 +45,7 @@ where
         let create_sql = match &item.definition {
             SerializedCatalogItem::V1 { create_sql } => create_sql,
         };
-        let mut stmt = mz_sql::parse::parse(create_sql)?.into_element().ast;
+        let mut stmt = mz_sql::parse::parse(create_sql)?.into_element().stmt;
 
         f(tx, &cat, &mut stmt).await?;
 
