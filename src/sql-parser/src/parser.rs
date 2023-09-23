@@ -219,6 +219,12 @@ impl From<RecursionLimitError> for ParserError {
     }
 }
 
+impl From<ParserStatementError> for ParserError {
+    fn from(e: ParserStatementError) -> ParserError {
+        e.error
+    }
+}
+
 impl ParserError {
     /// Constructs an error with the provided message at the provided position.
     pub(crate) fn new<S>(pos: usize, message: S) -> ParserError
@@ -380,7 +386,9 @@ impl<'a> Parser<'a> {
                     Ok(self.parse_update().map_parser_err(StatementKind::Update)?)
                 }
                 Token::Keyword(ALTER) => Ok(self.parse_alter()?),
-                Token::Keyword(COPY) => Ok(self.parse_copy()?),
+                Token::Keyword(COPY) => {
+                    Ok(self.parse_copy().map_parser_err(StatementKind::Copy)?)
+                }
                 Token::Keyword(SET) => Ok(self.parse_set()?),
                 Token::Keyword(RESET) => Ok(self
                     .parse_reset()
@@ -4867,30 +4875,21 @@ impl<'a> Parser<'a> {
     }
 
     /// Parse a copy statement
-    fn parse_copy(&mut self) -> Result<Statement<Raw>, ParserStatementError> {
+    fn parse_copy(&mut self) -> Result<Statement<Raw>, ParserError> {
         let relation = if self.consume_token(&Token::LParen) {
-            let query = self.parse_statement()?.stmt;
-            self.expect_token(&Token::RParen)
-                .map_parser_err(StatementKind::Copy)?;
-            match query {
+            let stmt = self.parse_statement_inner()?;
+            self.expect_token(&Token::RParen)?;
+            match stmt {
                 Statement::Select(stmt) => CopyRelation::Select(stmt),
                 Statement::Subscribe(stmt) => CopyRelation::Subscribe(stmt),
-                _ => {
-                    return parser_err!(self, self.peek_prev_pos(), "unsupported query in COPY")
-                        .map_parser_err(StatementKind::Copy)
-                }
+                _ => return parser_err!(self, self.peek_prev_pos(), "unsupported query in COPY"),
             }
         } else {
-            let name = self.parse_raw_name().map_parser_err(StatementKind::Copy)?;
-            let columns = self
-                .parse_parenthesized_column_list(Optional)
-                .map_parser_err(StatementKind::Copy)?;
+            let name = self.parse_raw_name()?;
+            let columns = self.parse_parenthesized_column_list(Optional)?;
             CopyRelation::Table { name, columns }
         };
-        let (direction, target) = match self
-            .expect_one_of_keywords(&[FROM, TO])
-            .map_parser_err(StatementKind::Copy)?
-        {
+        let (direction, target) = match self.expect_one_of_keywords(&[FROM, TO])? {
             FROM => {
                 if let CopyRelation::Table { .. } = relation {
                     // Ok.
@@ -4899,16 +4898,13 @@ impl<'a> Parser<'a> {
                         self,
                         self.peek_prev_pos(),
                         "queries not allowed in COPY FROM"
-                    )
-                    .map_no_statement_parser_err();
+                    );
                 }
-                self.expect_keyword(STDIN)
-                    .map_parser_err(StatementKind::Copy)?;
+                self.expect_keyword(STDIN)?;
                 (CopyDirection::From, CopyTarget::Stdin)
             }
             TO => {
-                self.expect_keyword(STDOUT)
-                    .map_parser_err(StatementKind::Copy)?;
+                self.expect_keyword(STDOUT)?;
                 (CopyDirection::To, CopyTarget::Stdout)
             }
             _ => unreachable!(),
@@ -4917,18 +4913,14 @@ impl<'a> Parser<'a> {
         // compat with Postgres but is required elsewhere, which is why we don't use
         // parse_with_options here.
         let has_options = if self.parse_keyword(WITH) {
-            self.expect_token(&Token::LParen)
-                .map_parser_err(StatementKind::Copy)?;
+            self.expect_token(&Token::LParen)?;
             true
         } else {
             self.consume_token(&Token::LParen)
         };
         let options = if has_options {
-            let o = self
-                .parse_comma_separated(Parser::parse_copy_option)
-                .map_parser_err(StatementKind::Copy)?;
-            self.expect_token(&Token::RParen)
-                .map_parser_err(StatementKind::Copy)?;
+            let o = self.parse_comma_separated(Parser::parse_copy_option)?;
+            self.expect_token(&Token::RParen)?;
             o
         } else {
             vec![]
