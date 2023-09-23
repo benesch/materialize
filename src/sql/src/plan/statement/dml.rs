@@ -36,7 +36,7 @@ use crate::normalize;
 use crate::plan::query::{plan_up_to, ExprContext, QueryLifetime};
 use crate::plan::scope::Scope;
 use crate::plan::statement::{StatementContext, StatementDesc};
-use crate::plan::with_options::TryFromValue;
+use crate::plan::with_options::{TryFromValue, Wildcardable};
 use crate::plan::{self, side_effecting_func, ExplainTimestampPlan};
 use crate::plan::{
     query, CopyFormat, CopyFromPlan, ExplainPlanPlan, InsertPlan, MutationKind, Params, Plan,
@@ -736,7 +736,10 @@ generate_extracted_config!(
     (Null, String),
     (Escape, String),
     (Quote, String),
-    (Header, bool)
+    (Header, bool),
+    (ForceQuote, Wildcardable<Vec<String>>),
+    (ForceNull, Vec<String>),
+    (ForceNotNull, Vec<String>)
 );
 
 pub fn plan_copy(
@@ -755,6 +758,15 @@ pub fn plan_copy(
         "binary" => CopyFormat::Binary,
         _ => sql_bail!("unknown FORMAT: {}", options.format),
     };
+    if options.force_quote.is_some() {
+        bail_unsupported!("FORCE_QUOTE");
+    }
+    if options.force_null.is_some() {
+        bail_unsupported!("FORCE_NULL");
+    }
+    if options.force_not_null.is_some() {
+        bail_unsupported!("FORCE_NOT_NULL");
+    }
     if let CopyDirection::To = direction {
         if options.delimiter.is_some() {
             sql_bail!("COPY TO does not support DELIMITER option yet");

@@ -4051,7 +4051,9 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_option_value(&mut self) -> Result<WithOptionValue<Raw>, ParserError> {
-        if let Some(seq) = self.parse_option_sequence(Parser::parse_option_value)? {
+        if self.consume_token(&Token::Star) {
+            Ok(WithOptionValue::Star)
+        } else if let Some(seq) = self.parse_option_sequence(Parser::parse_option_value)? {
             Ok(WithOptionValue::Sequence(seq))
         } else if self.parse_keyword(SECRET) {
             if let Some(secret) = self.maybe_parse(Parser::parse_raw_name) {
@@ -4934,16 +4936,28 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_copy_option(&mut self) -> Result<CopyOption<Raw>, ParserError> {
-        let name =
-            match self.expect_one_of_keywords(&[FORMAT, DELIMITER, NULL, ESCAPE, QUOTE, HEADER])? {
-                FORMAT => CopyOptionName::Format,
-                DELIMITER => CopyOptionName::Delimiter,
-                NULL => CopyOptionName::Null,
-                ESCAPE => CopyOptionName::Escape,
-                QUOTE => CopyOptionName::Quote,
-                HEADER => CopyOptionName::Header,
-                _ => unreachable!(),
-            };
+        let name = match self.expect_one_of_keywords(&[
+            FORMAT,
+            DELIMITER,
+            NULL,
+            ESCAPE,
+            QUOTE,
+            HEADER,
+            FORCE_QUOTE,
+            FORCE_NULL,
+            FORCE_NOT_NULL,
+        ])? {
+            FORMAT => CopyOptionName::Format,
+            DELIMITER => CopyOptionName::Delimiter,
+            NULL => CopyOptionName::Null,
+            ESCAPE => CopyOptionName::Escape,
+            QUOTE => CopyOptionName::Quote,
+            HEADER => CopyOptionName::Header,
+            FORCE_QUOTE => CopyOptionName::ForceQuote,
+            FORCE_NULL => CopyOptionName::ForceNull,
+            FORCE_NOT_NULL => CopyOptionName::ForceNotNull,
+            _ => unreachable!(),
+        };
         let value = self.parse_optional_option_value()?;
         Ok(CopyOption { name, value })
     }

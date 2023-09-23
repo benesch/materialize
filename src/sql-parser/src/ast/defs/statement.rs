@@ -343,6 +343,9 @@ pub enum CopyOptionName {
     Escape,
     Quote,
     Header,
+    ForceQuote,
+    ForceNull,
+    ForceNotNull,
 }
 
 impl AstDisplay for CopyOptionName {
@@ -354,6 +357,9 @@ impl AstDisplay for CopyOptionName {
             CopyOptionName::Escape => "ESCAPE",
             CopyOptionName::Quote => "QUOTE",
             CopyOptionName::Header => "HEADER",
+            CopyOptionName::ForceQuote => "FORCE_QUOTE",
+            CopyOptionName::ForceNull => "FORCE_NULL",
+            CopyOptionName::ForceNotNull => "FORCE_NOT_NULL",
         })
     }
 }
@@ -2857,6 +2863,7 @@ impl_display_t!(ShowStatementFilter);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum WithOptionValue<T: AstInfo> {
+    Star,
     Value(Value),
     Ident(Ident),
     DataType(T::DataType),
@@ -2872,6 +2879,7 @@ pub enum WithOptionValue<T: AstInfo> {
 impl<T: AstInfo> AstDisplay for WithOptionValue<T> {
     fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
         match self {
+            WithOptionValue::Star => f.write_str("*"),
             WithOptionValue::Sequence(values) => {
                 f.write_str("(");
                 f.write_node(&display::comma_separated(values));

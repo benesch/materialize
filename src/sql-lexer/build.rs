@@ -113,6 +113,7 @@ fn main() -> Result<()> {
         let mut buf = CodegenBuf::new();
 
         buf.writeln("#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]");
+        buf.writeln("#[allow(non_camel_case_types)]");
         buf.write_block("pub enum Keyword", |buf| {
             for kw in &keywords {
                 buf.writeln(format!("{},", kw));

@@ -197,6 +197,37 @@ impl ImpliedValue for OptionalInterval {
     }
 }
 
+#[derive(Copy, Clone, Debug)]
+pub enum Wildcardable<V> {
+    Wildcard,
+    Value(V),
+}
+
+impl<V> TryFromValue<WithOptionValue<Aug>> for Wildcardable<V>
+where
+    V: TryFromValue<WithOptionValue<Aug>>,
+{
+    fn try_from_value(v: WithOptionValue<Aug>) -> Result<Self, PlanError> {
+        match v {
+            WithOptionValue::Star => Ok(Wildcardable::Wildcard),
+            _ => V::try_from_value(v).map(Wildcardable::Value),
+        }
+    }
+
+    fn name() -> String {
+        V::name()
+    }
+}
+
+impl<V> ImpliedValue for Wildcardable<V>
+where
+    V: TryFromValue<WithOptionValue<Aug>>,
+{
+    fn implied_value() -> Result<Self, PlanError> {
+        sql_bail!("must provide a {} value", V::name())
+    }
+}
+
 impl TryFromValue<Value> for String {
     fn try_from_value(v: Value) -> Result<Self, PlanError> {
         match v {
@@ -404,7 +435,8 @@ impl<V: TryFromValue<Value>, T: AstInfo + std::fmt::Debug> TryFromValue<WithOpti
         match v {
             WithOptionValue::Value(v) => V::try_from_value(v),
             WithOptionValue::Ident(i) => V::try_from_value(Value::String(i.into_string())),
-            WithOptionValue::Sequence(_)
+            WithOptionValue::Star
+            | WithOptionValue::Sequence(_)
             | WithOptionValue::Item(_)
             | WithOptionValue::UnresolvedItemName(_)
             | WithOptionValue::Secret(_)
@@ -413,6 +445,7 @@ impl<V: TryFromValue<Value>, T: AstInfo + std::fmt::Debug> TryFromValue<WithOpti
             | WithOptionValue::ConnectionKafkaBroker(_) => sql_bail!(
                 "incompatible value types: cannot convert {} to {}",
                 match v {
+                    WithOptionValue::Star => "wildcard",
                     WithOptionValue::Sequence(_) => "sequences",
                     WithOptionValue::Item(_) => "object references",
                     WithOptionValue::UnresolvedItemName(_) => "object names",
