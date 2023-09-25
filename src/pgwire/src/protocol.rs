@@ -1940,17 +1940,8 @@ where
             mz_pgrepr::Format,
         ) = match format {
             CopyFormat::Text => (mz_pgcopy::encode_copy_row_text, mz_pgrepr::Format::Text),
+            CopyFormat::Csv => (mz_pgcopy::encode_copy_row_csv, mz_pgrepr::Format::Text),
             CopyFormat::Binary => (mz_pgcopy::encode_copy_row_binary, mz_pgrepr::Format::Binary),
-            _ => {
-                let msg = format!("COPY TO format {:?} not supported", format);
-                return self
-                    .error(ErrorResponse::error(
-                        SqlState::FEATURE_NOT_SUPPORTED,
-                        msg.clone(),
-                    ))
-                    .await
-                    .map(|state| (state, SendRowsEndedReason::Errored { error: msg }));
-            }
         };
 
         let typ = row_desc.typ();

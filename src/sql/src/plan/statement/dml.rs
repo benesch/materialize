@@ -16,7 +16,11 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use itertools::Itertools;
 use mz_expr::MirRelationExpr;
-use mz_pgcopy::{CopyCsvFormatParams, CopyFormatParams, CopyTextFormatParams, DEFAULT_COPY_TEXT_FORMAT_NULL, DEFAULT_COPY_CSV_FORMAT_NULL, DEFAULT_COPY_TEXT_FORMAT_DELIMITER, DEFAULT_COPY_CSV_FORMAT_DELIMITER, DEFAULT_COPY_CSV_FORMAT_QUOTE};
+use mz_pgcopy::{
+    CopyCsvFormatParams, CopyFormatParams, CopyTextFormatParams, DEFAULT_COPY_CSV_FORMAT_DELIMITER,
+    DEFAULT_COPY_CSV_FORMAT_NULL, DEFAULT_COPY_CSV_FORMAT_QUOTE,
+    DEFAULT_COPY_TEXT_FORMAT_DELIMITER, DEFAULT_COPY_TEXT_FORMAT_NULL,
+};
 use mz_repr::adt::numeric::NumericMaxScale;
 use mz_repr::explain::{ExplainConfig, ExplainFormat};
 use mz_repr::{RelationDesc, ScalarType};
@@ -691,19 +695,32 @@ fn plan_copy_from(
             only_available_with_csv(options.quote, "quote")?;
             only_available_with_csv(options.escape, "escape")?;
             only_available_with_csv(options.header, "HEADER")?;
-            let null = options.null.unwrap_or_else(|| DEFAULT_COPY_TEXT_FORMAT_NULL.into());
-            let delimiter = extract_byte_param_value(options.delimiter, DEFAULT_COPY_TEXT_FORMAT_DELIMITER, "delimiter")?;
+            let null = options
+                .null
+                .unwrap_or_else(|| DEFAULT_COPY_TEXT_FORMAT_NULL.into());
+            let delimiter = extract_byte_param_value(
+                options.delimiter,
+                DEFAULT_COPY_TEXT_FORMAT_DELIMITER,
+                "delimiter",
+            )?;
             only_available_with_csv(options.force_quote, "force quote")?;
             only_available_with_csv(options.force_null, "force null")?;
             only_available_with_csv(options.force_not_null, "force not null")?;
             CopyFormatParams::Text(CopyTextFormatParams { null, delimiter })
         }
         CopyFormat::Csv => {
-            let quote = extract_byte_param_value(options.quote, DEFAULT_COPY_CSV_FORMAT_QUOTE, "quote")?;
+            let quote =
+                extract_byte_param_value(options.quote, DEFAULT_COPY_CSV_FORMAT_QUOTE, "quote")?;
             let escape = extract_byte_param_value(options.escape, quote, "escape")?;
             let header = options.header.unwrap_or(false);
-            let null = options.null.unwrap_or_else(|| DEFAULT_COPY_CSV_FORMAT_NULL.into());
-            let delimiter = extract_byte_param_value(options.delimiter, DEFAULT_COPY_CSV_FORMAT_DELIMITER, "delimiter")?;
+            let null = options
+                .null
+                .unwrap_or_else(|| DEFAULT_COPY_CSV_FORMAT_NULL.into());
+            let delimiter = extract_byte_param_value(
+                options.delimiter,
+                DEFAULT_COPY_CSV_FORMAT_DELIMITER,
+                "delimiter",
+            )?;
             if options.force_quote.is_some() {
                 sql_bail!("COPY force quote only available using COPY TO");
             }

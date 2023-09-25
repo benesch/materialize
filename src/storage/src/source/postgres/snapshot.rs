@@ -139,7 +139,7 @@ use std::rc::Rc;
 
 use differential_dataflow::{AsCollection, Collection};
 use futures::TryStreamExt;
-use mz_pgcopy::{CopyTextFormatParser, CopyTextFormatParams};
+use mz_pgcopy::{CopyTextFormatParams, CopyTextFormatParser};
 use timely::dataflow::channels::pact::Pipeline;
 use timely::dataflow::operators::{Broadcast, ConnectLoop, Feedback};
 use timely::dataflow::{Scope, Stream};
