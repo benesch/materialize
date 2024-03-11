@@ -148,7 +148,7 @@ impl<T: ConfigType> Config<T> {
 }
 
 /// A type usable as a [Config].
-pub trait ConfigType: Sized {
+pub trait ConfigType: Into<ConfigVal> + Clone + Sized {
     /// A const-compatible type suitable for use as the default value of configs
     /// of this type.
     type Default: Into<Self> + Clone;
@@ -157,9 +157,6 @@ pub trait ConfigType: Sized {
     ///
     /// Panics if the enum's variant does not match this type.
     fn from_val(val: ConfigVal) -> Self;
-
-    /// Converts this type to its type-erased enum equivalent.
-    fn to_val(val: Self) -> ConfigVal;
 }
 
 /// An set of [Config]s with values independent of other [ConfigSet]s (even if
@@ -171,12 +168,17 @@ pub struct ConfigSet {
 
 impl ConfigSet {
     /// Adds the given config to this set.
-    pub fn add<T: ConfigType>(mut self, config: &Config<T>) -> Self {
+    pub fn add<T>(mut self, config: &Config<T>) -> Self
+    where
+        T: ConfigType,
+    {
+        let default = Into::<T>::into(config.default.clone());
+        let default = Into::<ConfigVal>::into(default);
         let config = ConfigEntry {
             name: config.name,
             desc: config.desc,
-            default: T::to_val(config.default.clone().into()),
-            val: T::to_val(config.default.clone().into()).into(),
+            default: default.clone(),
+            val: ConfigValAtomic::from(default),
         };
         if let Some(prev) = self.configs.insert(config.name.to_owned(), config) {
             panic!("{} registered twice", prev.name);
@@ -351,7 +353,7 @@ impl ConfigUpdates {
     {
         self.updates.push(ProtoConfigVal {
             name: config.name.to_owned(),
-            val: T::to_val(val).into_proto(),
+            val: val.into().into_proto(),
         });
     }
 
@@ -362,10 +364,13 @@ impl ConfigUpdates {
     ///
     /// If a value of the same config has previously been added to these
     /// updates, replaces it.
-    pub fn add_dynamic(&mut self, name: &'static str, val: ConfigVal) {
+    pub fn add_dynamic<T>(&mut self, name: &'static str, val: T)
+    where
+        T: Into<ConfigVal>,
+    {
         self.updates.push(ProtoConfigVal {
             name: name.to_owned(),
-            val: val.into_proto(),
+            val: val.into().into_proto(),
         });
     }
 
@@ -418,7 +423,10 @@ mod impls {
                 x => panic!("expected bool value got {:?}", x),
             }
         }
-        fn to_val(val: Self) -> ConfigVal {
+    }
+
+    impl From<bool> for ConfigVal {
+        fn from(val: bool) -> ConfigVal {
             ConfigVal::Bool(val)
         }
     }
@@ -432,7 +440,10 @@ mod impls {
                 x => panic!("expected u32 value got {:?}", x),
             }
         }
-        fn to_val(val: Self) -> ConfigVal {
+    }
+
+    impl From<u32> for ConfigVal {
+        fn from(val: u32) -> ConfigVal {
             ConfigVal::U32(val)
         }
     }
@@ -446,7 +457,10 @@ mod impls {
                 x => panic!("expected usize value got {:?}", x),
             }
         }
-        fn to_val(val: Self) -> ConfigVal {
+    }
+
+    impl From<usize> for ConfigVal {
+        fn from(val: usize) -> ConfigVal {
             ConfigVal::Usize(val)
         }
     }
@@ -460,7 +474,10 @@ mod impls {
                 x => panic!("expected usize value got {:?}", x),
             }
         }
-        fn to_val(val: Self) -> ConfigVal {
+    }
+
+    impl From<Option<usize>> for ConfigVal {
+        fn from(val: Option<usize>) -> ConfigVal {
             ConfigVal::OptUsize(val)
         }
     }
@@ -474,7 +491,10 @@ mod impls {
                 x => panic!("expected String value got {:?}", x),
             }
         }
-        fn to_val(val: Self) -> ConfigVal {
+    }
+
+    impl From<String> for ConfigVal {
+        fn from(val: String) -> ConfigVal {
             ConfigVal::String(val)
         }
     }
@@ -488,7 +508,10 @@ mod impls {
                 x => panic!("expected Duration value got {:?}", x),
             }
         }
-        fn to_val(val: Self) -> ConfigVal {
+    }
+
+    impl From<Duration> for ConfigVal {
+        fn from(val: Duration) -> ConfigVal {
             ConfigVal::Duration(val)
         }
     }
@@ -600,7 +623,7 @@ mod tests {
         // We can copy values from one to the other, though (envd -> clusterd).
         let mut updates = ConfigUpdates::default();
         for e in c0.entries() {
-            updates.add_dynamic(e.name, e.val.load());
+            updates.add_dynamic(e.name, e.val());
         }
         assert_eq!(USIZE.get(&c1), 3);
         updates.apply(&c1);
