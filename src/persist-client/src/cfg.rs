@@ -210,8 +210,9 @@ impl PersistConfig {
     }
 
     pub(crate) fn set_config<T: ConfigType>(&self, cfg: &Config<T>, val: T) {
-        let shared = cfg.shared(self);
-        T::set(&shared, val)
+        let mut updates = ConfigUpdates::default();
+        updates.add(cfg, val);
+        updates.apply(self)
     }
 
     /// The minimum number of updates that justify writing out a batch in `persist_sink`'s
