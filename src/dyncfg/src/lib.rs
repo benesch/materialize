@@ -56,11 +56,13 @@
 //!   and doesn't want to instantiate a catalog impl.
 
 use std::collections::BTreeMap;
+use std::marker::PhantomData;
 use std::sync::atomic::Ordering::SeqCst;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
+use ref_cast::{ref_cast_custom, RefCastCustom};
 use tracing::error;
 
 use mz_proto::{ProtoType, RustType};
@@ -130,24 +132,18 @@ impl<T: ConfigType> Config<T> {
     /// the more important "noun" and also that rustfmt would maybe work better
     /// on this ordering.
     pub fn get(&self, set: &ConfigSet) -> T {
-        self.get_from_shared(self.shared(set))
+        self.handle(set).get()
     }
 
     /// Returns the shared value of this config in the given set.
     ///
     /// This allows users to amortize the name lookup with
     /// `Self::get_from_shared`.
-    pub fn shared<'a>(&self, set: &'a ConfigSet) -> &'a ConfigValAtomic {
-        &set.configs
+    pub fn handle<'a>(&self, set: &'a ConfigSet) -> &'a ConfigValHandle<T> {
+        set.configs
             .get(self.name)
             .expect("config should be registered to set")
-            .val
-    }
-
-    /// [Self::get] except from a previously looked up shared value returned by
-    /// [Self::shared].
-    pub fn get_from_shared(&self, shared: &ConfigValAtomic) -> T {
-        T::from_val(shared.load())
+            .handle()
     }
 }
 
@@ -225,6 +221,43 @@ impl ConfigEntry {
     pub fn val(&self) -> ConfigVal {
         self.val.load()
     }
+
+    /// Constructs a handle to the value of this config in the set.
+    ///
+    /// It is the caller's responsibility to construct the handle with the
+    /// correct type.
+    fn handle<T>(&self) -> &ConfigValHandle<T>
+    where
+        T: ConfigType,
+    {
+        ConfigValHandle::<T>::new(&self.val)
+    }
+}
+
+/// A handle to a configuration value in a [`ConfigSet`].
+///
+/// Allows users to amortize the lookup of a name within a set.
+///
+/// Handles can be cheaply cloned.
+#[derive(Debug, Clone, RefCastCustom)]
+#[repr(transparent)]
+pub struct ConfigValHandle<T> {
+    val: ConfigValAtomic,
+    _type: PhantomData<T>,
+}
+
+impl<T> ConfigValHandle<T>
+where
+    T: ConfigType,
+{
+    #[ref_cast_custom]
+    fn new(val: &ConfigValAtomic) -> &ConfigValHandle<T>;
+
+    /// Returns the latest value of this config within the set associated with
+    /// the handle.
+    pub fn get(&self) -> T {
+        T::from_val(self.val.load())
+    }
 }
 
 /// A type-erased configuration value for when set of different types are stored
@@ -250,7 +283,7 @@ pub enum ConfigVal {
 // TODO(cfg): Consider moving these Arcs to be a single one around the map in
 // `ConfigSet` instead. That would mean less pointer-chasing in the common
 // case, but would remove the possibility of amortizing the name lookup via
-// [Config::get_from_shared].
+// [Config::handle].
 #[derive(Clone, Debug)]
 enum ConfigValAtomic {
     Bool(Arc<AtomicBool>),
